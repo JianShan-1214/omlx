@@ -93,6 +93,11 @@ class ModelSettingsRequest(BaseModel):
     index_cache_freq: Optional[int] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
+    # SpecPrefill (experimental)
+    specprefill_enabled: Optional[bool] = None
+    specprefill_draft_model: Optional[str] = None
+    specprefill_keep_pct: Optional[float] = None
+    specprefill_threshold: Optional[int] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -113,6 +118,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # Memory enforcement
     max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
+    memory_prefill_memory_guard: Optional[bool] = None
 
     # Scheduler settings
     max_num_seqs: Optional[int] = None
@@ -188,6 +194,20 @@ class MSRetryRequest(BaseModel):
     """Request model for retrying a ModelScope model download."""
 
     ms_token: str = ""
+
+
+class OQStartRequest(BaseModel):
+    """Request model for starting an oQ quantization task."""
+
+    model_path: str
+    oq_level: int
+    enable_clip: bool = False
+    group_size: int = 64
+    clip_num_samples: int = 128
+    clip_seq_length: int = 512
+    clip_n_grid: int = 20
+    calib_dataset: str = "default"
+    clip_batch_size: int = 1024
 
 
 # =============================================================================
@@ -679,6 +699,7 @@ _get_settings_manager = None
 _get_global_settings = None
 _hf_downloader = None
 _ms_downloader = None
+_oq_manager = None
 
 
 def set_admin_getters(
@@ -725,6 +746,16 @@ def set_ms_downloader(downloader):
     """
     global _ms_downloader
     _ms_downloader = downloader
+
+
+def set_oq_manager(manager):
+    """Set the OQManager instance for admin routes.
+
+    Args:
+        manager: OQManager instance created during server initialization.
+    """
+    global _oq_manager
+    _oq_manager = manager
 
 
 # =============================================================================
@@ -1218,6 +1249,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         model_data = {
             "id": model_id,
+            "model_path": model_info.get("model_path", ""),
             "loaded": model_info.get("loaded", False),
             "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
@@ -1251,6 +1283,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
                 "index_cache_freq": settings.index_cache_freq,
+                "specprefill_enabled": settings.specprefill_enabled,
+                "specprefill_draft_model": settings.specprefill_draft_model,
+                "specprefill_keep_pct": settings.specprefill_keep_pct,
+                "specprefill_threshold": settings.specprefill_threshold,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1451,6 +1487,16 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
+    # SpecPrefill settings
+    if "specprefill_enabled" in sent:
+        current_settings.specprefill_enabled = request.specprefill_enabled or False
+    if "specprefill_draft_model" in sent:
+        current_settings.specprefill_draft_model = request.specprefill_draft_model or None
+    if "specprefill_keep_pct" in sent:
+        current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
+    if "specprefill_threshold" in sent:
+        current_settings.specprefill_threshold = request.specprefill_threshold or None
+
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -1793,6 +1839,23 @@ async def update_global_settings(
                 logger.warning(f"Failed to apply max_process_memory: {msg}")
         except Exception as e:
             logger.warning(f"Error applying max_process_memory: {e}")
+
+    # Apply prefill memory guard setting (Live)
+    if request.memory_prefill_memory_guard is not None:
+        global_settings.memory.prefill_memory_guard = (
+            request.memory_prefill_memory_guard
+        )
+        from ..server import _server_state
+
+        if _server_state.process_memory_enforcer is not None:
+            _server_state.process_memory_enforcer.prefill_memory_guard = (
+                request.memory_prefill_memory_guard
+            )
+        runtime_applied.append("prefill_memory_guard")
+        logger.info(
+            f"Prefill memory guard "
+            f"{'enabled' if request.memory_prefill_memory_guard else 'disabled'}"
+        )
 
     # Apply scheduler settings (restart required)
     if request.max_num_seqs is not None:
@@ -2495,18 +2558,28 @@ def _build_active_models_data() -> dict:
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
+        active_request_ids: set = set()
         entry = engine_pool._entries.get(model_id)
         if entry and entry.engine is not None:
             async_core = getattr(entry.engine, "_engine", None)
             if async_core is not None:
                 core = getattr(async_core, "engine", None)
                 if core is not None:
-                    active_requests = len(getattr(core, "_output_collectors", {}))
+                    collectors = getattr(core, "_output_collectors", {})
+                    active_request_ids = set(collectors.keys())
+                    active_requests = len(collectors)
                     sched = getattr(core, "scheduler", None)
                     if sched is not None:
                         waiting_requests = len(getattr(sched, "waiting", []))
 
         prefilling = tracker.get_model_progress(model_id)
+        prefilling_ids = {p["request_id"] for p in prefilling}
+
+        # Generating = active requests that finished prefill
+        generating = [
+            {"request_id": rid}
+            for rid in sorted(active_request_ids - prefilling_ids)
+        ]
 
         models.append({
             "id": model_id,
@@ -2519,6 +2592,7 @@ def _build_active_models_data() -> dict:
             "active_requests": active_requests,
             "waiting_requests": waiting_requests,
             "prefilling": prefilling,
+            "generating": generating,
         })
 
         total_active += active_requests
@@ -2635,8 +2709,11 @@ async def remove_hf_task(
 
 
 @router.get("/api/hf/recommended")
-async def get_recommended_models(is_admin: bool = Depends(require_admin)):
-    """Get recommended mlx-community models filtered by system memory."""
+async def get_recommended_models(
+    mlx_only: bool = True,
+    is_admin: bool = Depends(require_admin),
+):
+    """Get recommended models filtered by system memory."""
     if _hf_downloader is None:
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
@@ -2647,7 +2724,7 @@ async def get_recommended_models(is_admin: bool = Depends(require_admin)):
 
     try:
         result = await HFDownloader.get_recommended_models(
-            max_memory_bytes=max_memory, result_limit=50
+            max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
         )
         return result
     except asyncio.TimeoutError:
@@ -2664,6 +2741,7 @@ async def search_hf_models(
     q: str = "",
     sort: str = "trending",
     limit: int = 100,
+    mlx_only: bool = True,
     is_admin: bool = Depends(require_admin),
 ):
     """Search HuggingFace models by query."""
@@ -2677,6 +2755,7 @@ async def search_hf_models(
             query=q.strip(),
             sort=sort,
             limit=min(limit, 100),
+            mlx_only=mlx_only,
         )
         return result
     except asyncio.TimeoutError:
@@ -2977,8 +3056,11 @@ async def remove_ms_task(
 
 
 @router.get("/api/ms/recommended")
-async def get_ms_recommended_models(is_admin: bool = Depends(require_admin)):
-    """Get recommended MLX models from ModelScope filtered by system memory."""
+async def get_ms_recommended_models(
+    mlx_only: bool = True,
+    is_admin: bool = Depends(require_admin),
+):
+    """Get recommended models from ModelScope filtered by system memory."""
     if _ms_downloader is None:
         raise HTTPException(status_code=503, detail="ModelScope downloader not initialized")
 
@@ -2989,7 +3071,7 @@ async def get_ms_recommended_models(is_admin: bool = Depends(require_admin)):
 
     try:
         result = await MSDownloader.get_recommended_models(
-            max_memory_bytes=max_memory, result_limit=50
+            max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
         )
         return result
     except asyncio.TimeoutError:
@@ -3006,6 +3088,7 @@ async def search_ms_models(
     q: str = "",
     sort: str = "trending",
     limit: int = 100,
+    mlx_only: bool = True,
     is_admin: bool = Depends(require_admin),
 ):
     """Search ModelScope models by query."""
@@ -3019,6 +3102,7 @@ async def search_ms_models(
             query=q.strip(),
             sort=sort,
             limit=min(limit, 100),
+            mlx_only=mlx_only,
         )
         return result
     except asyncio.TimeoutError:
@@ -3062,7 +3146,166 @@ async def get_ms_model_info(
 
 
 # =============================================================================
-# Benchmark API Routes
+# Accuracy Benchmark API Routes (MUST be before throughput {bench_id} routes)
+# =============================================================================
+
+
+@router.post("/api/bench/accuracy/queue/add")
+async def add_to_accuracy_queue(
+    request: Request,
+    is_admin: bool = Depends(require_admin),
+):
+    """Add a model to the accuracy benchmark queue and start if idle."""
+    from .accuracy_benchmark import (
+        AccuracyBenchmarkRequest,
+        add_to_queue,
+        get_queue_status,
+        start_next_from_queue,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    body = await request.json()
+    try:
+        bench_request = AccuracyBenchmarkRequest(**body)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    entry = engine_pool.get_entry(bench_request.model_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model not found: {bench_request.model_id}"
+        )
+    if entry.model_type not in ("llm", "vlm", None):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {bench_request.model_id} is not a supported model (type: {entry.model_type})",
+        )
+
+    add_to_queue(bench_request)
+
+    logger.info(
+        f"Accuracy queue: added {bench_request.model_id} "
+        f"benchmarks={list(bench_request.benchmarks.keys())}"
+    )
+
+    # Start processing if not already running (synchronous — sets bench_id immediately)
+    start_next_from_queue(engine_pool)
+
+    return get_queue_status()
+
+
+@router.get("/api/bench/accuracy/queue/status")
+async def get_accuracy_queue_status(
+    is_admin: bool = Depends(require_admin),
+):
+    """Get accuracy benchmark queue status."""
+    from .accuracy_benchmark import get_queue_status
+
+    return get_queue_status()
+
+
+@router.delete("/api/bench/accuracy/queue/{idx}")
+async def remove_from_accuracy_queue(
+    idx: int,
+    is_admin: bool = Depends(require_admin),
+):
+    """Remove an item from the accuracy benchmark queue."""
+    from .accuracy_benchmark import get_queue_status, remove_from_queue
+
+    if not remove_from_queue(idx):
+        raise HTTPException(status_code=404, detail=f"Queue index {idx} not found")
+
+    return get_queue_status()
+
+
+@router.get("/api/bench/accuracy/results")
+async def get_accumulated_accuracy_results(
+    is_admin: bool = Depends(require_admin),
+):
+    """Get all accumulated accuracy benchmark results."""
+    from .accuracy_benchmark import get_accumulated_results, get_queue_status
+
+    status = get_queue_status()
+    return {
+        "results": get_accumulated_results(),
+        "running": status["running"],
+        "current_model": status["current_model"],
+        "current_bench_id": status["current_bench_id"],
+    }
+
+
+@router.post("/api/bench/accuracy/results/reset")
+async def reset_accuracy_results(
+    is_admin: bool = Depends(require_admin),
+):
+    """Clear all accumulated accuracy benchmark results."""
+    from .accuracy_benchmark import reset_accumulated_results
+
+    reset_accumulated_results()
+    return {"status": "reset"}
+
+
+@router.post("/api/bench/accuracy/cancel")
+async def cancel_accuracy_queue(
+    is_admin: bool = Depends(require_admin),
+):
+    """Cancel the current run and clear the queue."""
+    from .accuracy_benchmark import cancel_queue
+
+    await cancel_queue()
+    return {"status": "cancelled"}
+
+
+@router.get("/api/bench/accuracy/{bench_id}/stream")
+async def stream_accuracy_benchmark(
+    bench_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Stream accuracy benchmark progress via Server-Sent Events."""
+    import json
+
+    from fastapi.responses import StreamingResponse
+
+    from .accuracy_benchmark import get_run
+
+    run = get_run(bench_id)
+    if run is None:
+        raise HTTPException(
+            status_code=404, detail=f"Accuracy benchmark not found: {bench_id}"
+        )
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+
+                yield f"data: {json.dumps(event)}\n\n"
+
+                if event.get("type") in ("done", "error"):
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# =============================================================================
+# Benchmark API Routes (Throughput)
 # =============================================================================
 
 
@@ -3317,3 +3560,113 @@ async def check_update(
         _update_cache_time = now
 
     return _update_cache
+
+
+# =============================================================================
+# oQ Quantization API Routes
+# =============================================================================
+
+
+@router.get("/api/oq/models")
+async def list_oq_models(is_admin: bool = Depends(require_admin)):
+    """List non-quantized models available for oQ quantization."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    models = await _oq_manager.list_quantizable_models()
+    return {"models": models}
+
+
+@router.get("/api/oq/estimate")
+async def estimate_oq(
+    model_path: str,
+    oq_level: int,
+    is_admin: bool = Depends(require_admin),
+):
+    """Estimate effective bpw and output size for a model at given oQ level."""
+    from ..oq import estimate_bpw_and_size
+
+    try:
+        result = await asyncio.to_thread(
+            estimate_bpw_and_size, model_path, oq_level
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/api/oq/start")
+async def start_oq_quantization(
+    request: OQStartRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start an oQ quantization task."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    if request.oq_level not in (2, 3, 4, 5, 6, 8):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, or 8",
+        )
+    try:
+        task = await _oq_manager.start_quantization(
+            model_path=request.model_path,
+            oq_level=request.oq_level,
+            enable_clip=request.enable_clip,
+            group_size=request.group_size,
+            clip_num_samples=request.clip_num_samples,
+            clip_seq_length=request.clip_seq_length,
+            clip_n_grid=request.clip_n_grid,
+            calib_dataset=request.calib_dataset,
+            clip_batch_size=request.clip_batch_size,
+        )
+        return {"success": True, "task": task.to_dict()}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/oq/tasks")
+async def list_oq_tasks(is_admin: bool = Depends(require_admin)):
+    """List all quantization tasks."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    return {"tasks": _oq_manager.get_tasks()}
+
+
+@router.post("/api/oq/cancel/{task_id}")
+async def cancel_oq_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Cancel an active quantization task."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    success = await _oq_manager.cancel_quantization(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or not cancellable"
+        )
+    return {"success": True}
+
+
+@router.delete("/api/oq/task/{task_id}")
+async def remove_oq_task(
+    task_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Remove a completed/failed/cancelled task."""
+    if _oq_manager is None:
+        raise HTTPException(
+            status_code=503, detail="oQ quantizer not initialized"
+        )
+    success = _oq_manager.remove_task(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=404, detail="Task not found or still active"
+        )
+    return {"success": True}

@@ -7,7 +7,8 @@
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
-    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader']);
+    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer']);
+    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
 
     function dashboard() {
         return {
@@ -25,7 +26,7 @@
                 base_path: '',
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
-                memory: { max_process_memory: 'auto' },
+                memory: { max_process_memory: 'auto', prefill_memory_guard: true },
                 scheduler: { max_num_seqs: 8, completion_batch_size: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
@@ -189,6 +190,7 @@
             hfRecommendedLoaded: false,
             hfRecommendedLoading: false,
             hfRecommendedTab: 'trending',
+            hfMlxOnly: true,
 
             // Pagination state
             hfPage: { trending: 1, popular: 1, search: 1 },
@@ -227,6 +229,7 @@
             msRecommendedLoaded: false,
             msRecommendedLoading: false,
             msRecommendedTab: 'trending',
+            msMlxOnly: true,
 
             // MS Pagination state
             msPage: { trending: 1, popular: 1, search: 1 },
@@ -245,6 +248,25 @@
             // MS Model detail modal
             msModelDetail: null,
             msModelDetailLoading: false,
+
+            // oQ Quantizer state
+            oqModels: [],
+            oqModelsLoaded: false,
+            oqSelectedModelPath: '',
+            oqLevel: 4,
+            oqStarting: false,
+            oqTasks: [],
+            oqError: '',
+            oqSuccess: '',
+            _oqRefreshTimer: null,
+            // oQ Advanced Settings
+            oqAdvancedOpen: false,
+            oqEnableClip: false,
+            oqGroupSize: 64,
+            oqClipSamples: 128,
+            oqClipSeqLen: 512,
+            oqCalibDataset: 'code_multilingual',
+            oqClipBatchSize: 1024,
 
             // Benchmark state
             benchModelId: '',
@@ -267,6 +289,33 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
+
+            // Bench sub-tab & dropdown
+            benchTab: 'throughput',
+            benchDropdown: false,
+
+            // Accuracy benchmark state
+            accModelId: '',
+            accBenchmarks: { mmlu: true, hellaswag: true, truthfulqa: true, gsm8k: false, livecodebench: false },
+            accSampleSizes: { mmlu: 300, hellaswag: 200, truthfulqa: 200, gsm8k: 100, livecodebench: 100 },
+            accBenchmarkList: [
+                { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+            ],
+            accBatchSize: 1,
+            accRunning: false,
+            accCurrentModel: '',
+            accCurrentBenchId: null,
+            accProgress: null,
+            accAllResults: [],   // accumulated across all models
+            accQueue: [],        // server queue mirror
+            accError: '',
+            accEventSource: null,
+            accShowText: false,
+            accCopied: false,
 
             async init() {
                 // Apply theme
@@ -291,6 +340,28 @@
                     this.handleMainTabChange(value);
                 });
 
+                this.$watch('hfMlxOnly', () => {
+                    this.hfRecommended = { trending: [], popular: [] };
+                    this.hfRecommendedLoaded = false;
+                    this.hfSearchResults = [];
+                    this.hfSearchLoaded = false;
+                    this.loadRecommendedModels();
+                    if (this.hfSearchQuery.trim()) {
+                        this.searchHFModels();
+                    }
+                });
+
+                this.$watch('msMlxOnly', () => {
+                    this.msRecommended = { trending: [], popular: [] };
+                    this.msRecommendedLoaded = false;
+                    this.msSearchResults = [];
+                    this.msSearchLoaded = false;
+                    this.loadMsRecommendedModels();
+                    if (this.msSearchQuery.trim()) {
+                        this.searchMSModels();
+                    }
+                });
+
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
                 });
@@ -310,9 +381,12 @@
                     this.stopLogRefresh();
                 }
                 if (value === 'models') {
-                    const loads = [this.loadHFModels(), this.loadHFTasks()];
+                    const loads = [this.loadHFModels(), this.loadHFTasks(), this.loadOQTasks()];
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
                         loads.push(this.loadRecommendedModels());
+                    }
+                    if (this.modelsTab === 'quantizer') {
+                        loads.push(this.loadOQModels());
                     }
                     if (this.msInitialized && this.msAvailable) {
                         loads.push(this.loadMSTasks());
@@ -324,12 +398,17 @@
                     const hasMsActive = this.msTasks.some(t =>
                         t.status === 'pending' || t.status === 'downloading');
                     if (hasMsActive) this.startMSRefresh();
+                    const hasOqActive = this.oqTasks.some(t =>
+                        ['pending', 'loading', 'quantizing', 'saving'].includes(t.status));
+                    if (hasOqActive) this.startOQRefresh();
                 } else {
                     this.stopHFRefresh();
                     this.stopMSRefresh();
+                    this.stopOQRefresh();
                 }
-                if (value === 'bench' && !this.benchDeviceInfo) {
-                    await this.loadBenchDeviceInfo();
+                if (value === 'bench') {
+                    if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
+                    await this.loadAccState();
                 }
                 this.$nextTick(() => lucide.createIcons());
             },
@@ -340,9 +419,12 @@
                 const settingsTab = params.get('settingsTab');
                 const modelsTab = params.get('modelsTab');
 
+                const benchTab = params.get('benchTab');
+
                 this.mainTab = DASHBOARD_MAIN_TABS.has(mainTab) ? mainTab : 'status';
                 this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
                 this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
+                this.benchTab = DASHBOARD_BENCH_TABS.has(benchTab) ? benchTab : 'throughput';
             },
 
             syncTabStateToUrl() {
@@ -359,6 +441,12 @@
                     url.searchParams.set('modelsTab', this.modelsTab);
                 } else {
                     url.searchParams.delete('modelsTab');
+                }
+
+                if (this.mainTab === 'bench') {
+                    url.searchParams.set('benchTab', this.benchTab);
+                } else {
+                    url.searchParams.delete('benchTab');
                 }
 
                 window.history.replaceState({}, '', url);
@@ -382,6 +470,9 @@
                 this.modelsTab = tab;
                 this.mainTab = 'models';
                 this.syncTabStateToUrl();
+                if (tab === 'quantizer') {
+                    this.loadOQModels();
+                }
             },
 
             async checkForUpdate() {
@@ -533,6 +624,7 @@
                             max_model_memory: this.globalSettings.model.max_model_memory,
                             model_fallback: this.globalSettings.model.model_fallback,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
+                            memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
                             max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
                             completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
                             cache_enabled: this.globalSettings.cache.enabled,
@@ -791,6 +883,10 @@
                     ttl_seconds: settings.ttl_seconds ?? null,
                     enableIndexCache: !!(settings.index_cache_freq),
                     index_cache_freq: settings.index_cache_freq || null,
+                    specprefill_enabled: settings.specprefill_enabled || false,
+                    specprefill_draft_model: settings.specprefill_draft_model || '',
+                    specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
+                    specprefill_threshold: settings.specprefill_threshold || null,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -853,6 +949,14 @@
                                     ? chatTemplateKwargs : null,
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
                                     ? forcedCtKwargs : null,
+                                specprefill_enabled: this.modelSettings.specprefill_enabled,
+                                specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
+                                specprefill_keep_pct: this.modelSettings.specprefill_enabled
+                                    ? parseFloat(this.modelSettings.specprefill_keep_pct) || 0.2
+                                    : null,
+                                specprefill_threshold: this.modelSettings.specprefill_enabled
+                                    ? (this.modelSettings.specprefill_threshold || null)
+                                    : null,
                             };
                         })()),
                     });
@@ -1465,6 +1569,377 @@
                 } catch (err) {
                     console.error('Failed to load device info:', err);
                 }
+            },
+
+            // Bench sub-tab
+            setBenchTab(tab) {
+                if (!DASHBOARD_BENCH_TABS.has(tab)) return;
+                this.benchTab = tab;
+                this.mainTab = 'bench';
+                this.syncTabStateToUrl();
+                if (tab === 'throughput') {
+                    this.loadBenchDeviceInfo();
+                }
+            },
+
+            // Accuracy benchmark functions
+
+            async loadAccState() {
+                // Load accumulated results + queue status from server (page load / tab switch)
+                try {
+                    const resp = await fetch('/admin/api/bench/accuracy/results');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.accAllResults = (data.results || []).map(r => ({ ...r, _showCategories: false }));
+                        this.accRunning = data.running || false;
+                        this.accCurrentModel = data.current_model || '';
+                        if (data.current_bench_id && data.running) {
+                            this.accCurrentBenchId = data.current_bench_id;
+                            this.connectAccSSE(data.current_bench_id);
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load accuracy state:', err);
+                }
+                await this.loadAccQueueStatus();
+            },
+
+            async loadAccQueueStatus() {
+                try {
+                    const resp = await fetch('/admin/api/bench/accuracy/queue/status');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.accQueue = data.queue || [];
+                        this.accRunning = data.running || false;
+                        this.accCurrentModel = data.current_model || '';
+                        if (data.current_bench_id) {
+                            this.accCurrentBenchId = data.current_bench_id;
+                        }
+                        // Restore last progress for reconnect
+                        if (data.last_progress && data.running) {
+                            this.accProgress = data.last_progress;
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load queue status:', err);
+                }
+            },
+
+            async addToAccQueue() {
+                if (!this.accModelId) return;
+                const selected = Object.entries(this.accBenchmarks)
+                    .filter(([_, v]) => v)
+                    .map(([k]) => k);
+                if (selected.length === 0) return;
+
+                this.accError = '';
+
+                try {
+                    const resp = await fetch('/admin/api/bench/accuracy/queue/add', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: this.accModelId,
+                            benchmarks: Object.fromEntries(
+                                selected.map(k => [k, this.accSampleSizes[k]])
+                            ),
+                            batch_size: this.accBatchSize,
+                        }),
+                    });
+                    if (!resp.ok) {
+                        const err = await resp.json();
+                        throw new Error(err.detail || 'Failed to add to queue');
+                    }
+                    const data = await resp.json();
+                    this.accQueue = data.queue || [];
+                    this.accRunning = data.running || false;
+                    this.accCurrentModel = data.current_model || '';
+                    if (data.last_progress) this.accProgress = data.last_progress;
+
+                    // Connect SSE to current run
+                    if (data.current_bench_id) {
+                        this.accCurrentBenchId = data.current_bench_id;
+                        this.connectAccSSE(data.current_bench_id);
+                    }
+                } catch (err) {
+                    this.accError = err.message;
+                }
+            },
+
+            async removeFromAccQueue(idx) {
+                try {
+                    await fetch(`/admin/api/bench/accuracy/queue/${idx}`, { method: 'DELETE' });
+                    await this.loadAccQueueStatus();
+                } catch (err) {
+                    console.error('Failed to remove from queue:', err);
+                }
+            },
+
+            connectAccSSE(benchId) {
+                if (this.accEventSource) {
+                    this.accEventSource.close();
+                }
+                this._stopAccPolling();
+
+                const es = new EventSource(`/admin/api/bench/accuracy/${benchId}/stream`);
+                this.accEventSource = es;
+
+                es.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        switch (data.type) {
+                            case 'progress':
+                                this.accProgress = data;
+                                this.accCurrentModel = data.model_id || this.accCurrentModel;
+                                break;
+                            case 'result':
+                                data.data._showCategories = false;
+                                this.accAllResults.push(data.data);
+                                break;
+                            case 'done':
+                                this.accProgress = null;
+                                es.close();
+                                this.accEventSource = null;
+                                // Check for next in queue
+                                this._pollForNextRun();
+                                break;
+                            case 'error':
+                                this.accError = data.message;
+                                this.accProgress = null;
+                                es.close();
+                                this.accEventSource = null;
+                                this.loadAccQueueStatus();
+                                break;
+                        }
+                    } catch (err) {
+                        console.error('SSE parse error:', err);
+                    }
+                };
+
+                es.onerror = () => {
+                    es.close();
+                    this.accEventSource = null;
+                    // SSE disconnected — fall back to polling
+                    this._startAccPolling();
+                };
+            },
+
+            _startAccPolling() {
+                this._stopAccPolling();
+                this._accPollTimer = setInterval(async () => {
+                    await this.loadAccQueueStatus();
+                    // Load latest results too
+                    try {
+                        const resp = await fetch('/admin/api/bench/accuracy/results');
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            this.accAllResults = (data.results || []).map(r => ({ ...r, _showCategories: false }));
+                        }
+                    } catch (e) {}
+                    // Try to reconnect SSE if running
+                    if (this.accRunning && this.accCurrentBenchId && !this.accEventSource) {
+                        this._stopAccPolling();
+                        this.connectAccSSE(this.accCurrentBenchId);
+                    }
+                    if (!this.accRunning) {
+                        this._stopAccPolling();
+                    }
+                }, 3000);
+            },
+
+            _stopAccPolling() {
+                if (this._accPollTimer) {
+                    clearInterval(this._accPollTimer);
+                    this._accPollTimer = null;
+                }
+            },
+
+            _pollForNextRun() {
+                // After a run completes, poll briefly for the next run to start
+                let attempts = 0;
+                const poll = setInterval(async () => {
+                    attempts++;
+                    await this.loadAccQueueStatus();
+                    if (this.accCurrentBenchId && this.accRunning) {
+                        clearInterval(poll);
+                        this.connectAccSSE(this.accCurrentBenchId);
+                    } else if (!this.accRunning || attempts > 10) {
+                        clearInterval(poll);
+                    }
+                }, 1000);
+            },
+
+            async cancelAccuracyBenchmark() {
+                try {
+                    await fetch('/admin/api/bench/accuracy/cancel', { method: 'POST' });
+                } catch (err) {
+                    console.error('Cancel error:', err);
+                }
+                this.accRunning = false;
+                this.accProgress = null;
+                this.accQueue = [];
+                this.accCurrentModel = '';
+                if (this.accEventSource) {
+                    this.accEventSource.close();
+                    this.accEventSource = null;
+                }
+            },
+
+            async resetAccResults() {
+                try {
+                    await fetch('/admin/api/bench/accuracy/results/reset', { method: 'POST' });
+                    this.accAllResults = [];
+                } catch (err) {
+                    console.error('Reset error:', err);
+                }
+            },
+
+            accBuildText() {
+                if (this.accAllResults.length === 0) return '';
+                const pad = (s, w) => s.toString().padStart(w);
+                const rpad = (s, w) => s.toString().padEnd(w);
+
+                // Group by model
+                const models = [...new Set(this.accAllResults.map(r => r.model_id))];
+                const benchmarks = [...new Set(this.accAllResults.map(r => r.benchmark))];
+
+                // Build lookup: model -> benchmark -> accuracy
+                const lookup = {};
+                for (const r of this.accAllResults) {
+                    if (!lookup[r.model_id]) lookup[r.model_id] = {};
+                    lookup[r.model_id][r.benchmark] = r;
+                }
+
+                // Full sizes lookup
+                const fullSizes = {};
+                for (const bl of this.accBenchmarkList) fullSizes[bl.key] = bl.fullSize;
+
+                // Determine column widths
+                const modelWidth = Math.max(12, ...models.map(m => m.length + 2));
+                const modeW = 8;
+                const sampledW = 14;
+                const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
+
+                let lines = [];
+                lines.push('Intelligence Benchmark Comparison');
+                lines.push('');
+
+                // Header row
+                let header = rpad('', benchWidth) + rpad('Mode', modeW) + rpad('Sampled', sampledW);
+                for (const m of models) header += pad(m, modelWidth);
+                lines.push(header);
+                lines.push('-'.repeat(benchWidth + modeW + sampledW + models.length * modelWidth));
+
+                // Data rows
+                for (const b of benchmarks) {
+                    // Get sample info from first available result for this benchmark
+                    const sample = models.map(m => lookup[m]?.[b]).find(r => r);
+                    const total = sample?.total || 0;
+                    const full = fullSizes[b] || 0;
+                    const isFull = total >= full;
+                    const mode = isFull ? 'Full' : 'Sample';
+                    const sampledStr = isFull ? String(full) : (total + '/' + full);
+
+                    let row = rpad(b.toUpperCase(), benchWidth) + rpad(mode, modeW) + rpad(sampledStr, sampledW);
+                    for (const m of models) {
+                        const r = lookup[m]?.[b];
+                        row += pad(r ? (r.accuracy * 100).toFixed(1) + '%' : '-', modelWidth);
+                    }
+                    lines.push(row);
+                }
+
+                // Detail section per model
+                lines.push('');
+                lines.push('--- Detail ---');
+                for (const m of models) {
+                    lines.push('');
+                    lines.push('Model: ' + m);
+                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10));
+                    lines.push('-'.repeat(54));
+                    for (const r of this.accAllResults.filter(r => r.model_id === m)) {
+                        lines.push(
+                            rpad(r.benchmark.toUpperCase(), 16) +
+                            pad((r.accuracy * 100).toFixed(1) + '%', 10) +
+                            pad(r.correct, 10) +
+                            pad(r.total, 8) +
+                            pad(r.time_s, 10)
+                        );
+                    }
+                }
+
+                return lines.join('\n');
+            },
+
+            accCopyText() {
+                const text = this.accBuildText();
+                const onSuccess = () => {
+                    this.accCopied = true;
+                    setTimeout(() => { this.accCopied = false; }, 2000);
+                };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(onSuccess).catch(() => {
+                        const ta = document.getElementById('accTextarea');
+                        if (ta) { ta.select(); document.execCommand('copy'); onSuccess(); }
+                    });
+                } else {
+                    const ta = document.getElementById('accTextarea');
+                    if (ta) { ta.select(); document.execCommand('copy'); onSuccess(); }
+                }
+            },
+
+            accDownloadResult(r, format) {
+                const filename = `${r.model_id}_${r.benchmark}.${format}`;
+                let content, mime;
+                const qr = r.question_results || [];
+
+                if (format === 'json') {
+                    content = JSON.stringify({
+                        model_id: r.model_id,
+                        benchmark: r.benchmark,
+                        accuracy: r.accuracy,
+                        correct: r.correct,
+                        total: r.total,
+                        time_s: r.time_s,
+                        category_scores: r.category_scores || null,
+                        questions: qr,
+                    }, null, 2);
+                    mime = 'application/json';
+                } else if (format === 'csv') {
+                    const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
+                    const lines = ['id,correct,expected,predicted,question,raw_response,time_s'];
+                    for (const q of qr) {
+                        lines.push([q.id, q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                    }
+                    content = lines.join('\n');
+                    mime = 'text/csv';
+                } else {
+                    const lines = [
+                        `Model: ${r.model_id}`,
+                        `Benchmark: ${r.benchmark.toUpperCase()}`,
+                        `Accuracy: ${(r.accuracy * 100).toFixed(1)}% (${r.correct}/${r.total})`,
+                        `Time: ${r.time_s}s`,
+                        '',
+                    ];
+                    for (const q of qr) {
+                        lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
+                        lines.push(`Question: ${q.question || ''}`);
+                        lines.push(`Expected: ${q.expected}`);
+                        lines.push(`Predicted: ${q.predicted}`);
+                        lines.push(`Raw response: ${q.raw_response || '(empty)'}`);
+                        lines.push(`Time: ${q.time_s}s`);
+                        lines.push('');
+                    }
+                    content = lines.join('\n');
+                    mime = 'text/plain';
+                }
+
+                const blob = new Blob([content], { type: mime });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(url);
             },
 
             // Log viewer functions
@@ -2145,6 +2620,187 @@
             },
 
             // =================================================================
+            // oQ Quantization Functions
+            // =================================================================
+
+            async loadOQModels() {
+                try {
+                    const response = await fetch('/admin/api/oq/models');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.oqModels = data.models || [];
+                        this.oqModelsLoaded = true;
+                    }
+                } catch (err) {
+                    console.error('Failed to load quantizable models:', err);
+                }
+            },
+
+            async startOQQuantization() {
+                if (!this.oqSelectedModelPath || this.oqStarting) return;
+                this.oqError = '';
+                this.oqSuccess = '';
+                this.oqStarting = true;
+                try {
+                    const response = await fetch('/admin/api/oq/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_path: this.oqSelectedModelPath,
+                            oq_level: this.oqLevel,
+                            enable_clip: this.oqEnableClip,
+                            group_size: this.oqGroupSize,
+                            clip_num_samples: this.oqClipSamples,
+                            clip_seq_length: this.oqClipSeqLen,
+                            calib_dataset: this.oqCalibDataset,
+                            clip_batch_size: this.oqClipBatchSize,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok) {
+                        const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                        const name = model ? model.name : this.oqSelectedModelPath;
+                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}`;
+                        await this.loadOQTasks();
+                        this.startOQRefresh();
+                        setTimeout(() => { this.oqSuccess = ''; }, 5000);
+                    } else {
+                        this.oqError = data.detail || 'Failed to start quantization';
+                    }
+                } catch (err) {
+                    this.oqError = 'Connection error. Server may be unavailable.';
+                } finally {
+                    this.oqStarting = false;
+                    this.$nextTick(() => lucide.createIcons());
+                }
+            },
+
+            async loadOQTasks() {
+                try {
+                    const response = await fetch('/admin/api/oq/tasks');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.oqTasks = data.tasks || [];
+                        const hasActive = this.oqTasks.some(t =>
+                            ['pending', 'loading', 'quantizing', 'saving'].includes(t.status));
+                        if (!hasActive) {
+                            this.stopOQRefresh();
+                            if (this.oqTasks.some(t => t.status === 'completed')) {
+                                await this.loadHFModels();
+                                await this.loadModels();
+                                await this.loadOQModels();
+                            }
+                        }
+                        this.$nextTick(() => lucide.createIcons());
+                    }
+                } catch (err) {
+                    console.error('Failed to load oQ tasks:', err);
+                }
+            },
+
+            async cancelOQTask(taskId) {
+                try {
+                    await fetch(`/admin/api/oq/cancel/${taskId}`, { method: 'POST' });
+                    await this.loadOQTasks();
+                } catch (err) {
+                    console.error('Failed to cancel oQ task:', err);
+                }
+            },
+
+            async removeOQTask(taskId) {
+                try {
+                    await fetch(`/admin/api/oq/task/${taskId}`, { method: 'DELETE' });
+                    await this.loadOQTasks();
+                } catch (err) {
+                    console.error('Failed to remove oQ task:', err);
+                }
+            },
+
+            startOQRefresh() {
+                this.stopOQRefresh();
+                this._oqRefreshTimer = setInterval(() => {
+                    this.loadOQTasks();
+                }, 2000);
+            },
+
+            stopOQRefresh() {
+                if (this._oqRefreshTimer) {
+                    clearInterval(this._oqRefreshTimer);
+                    this._oqRefreshTimer = null;
+                }
+            },
+
+            formatOQProgress(task) {
+                const pct = Math.round(task.progress || 0);
+                return `${pct}% · ${task.phase || task.status}`;
+            },
+
+            formatOQElapsed(task) {
+                if (!task.started_at) return '';
+                const now = task.completed_at || (Date.now() / 1000);
+                const elapsed = now - task.started_at;
+                const mins = Math.floor(elapsed / 60);
+                const secs = Math.floor(elapsed % 60);
+                return `${mins}:${String(secs).padStart(2, '0')}`;
+            },
+
+            oqSelectedModelSupportsClip() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.supports_clip || false;
+            },
+
+            oqEstimatedMemory() {
+                // Use precise estimate from API if available
+                if (this.oqEstimate) {
+                    if (this.oqEnableClip) {
+                        return this.oqEstimate.memory_clip_formatted || '';
+                    }
+                    return this.oqEstimate.memory_streaming_formatted || '';
+                }
+                // Fallback to rough model-level estimate
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!model) return '';
+                if (this.oqEnableClip) {
+                    return model.memory_clip?.peak_formatted || '';
+                }
+                return model.memory_streaming?.peak_formatted || '';
+            },
+
+            oqEstimate: null,
+            _oqEstimateTimer: null,
+
+            oqEstimatedBpw() {
+                return this.oqEstimate?.effective_bpw?.toFixed(1) || '';
+            },
+
+            oqEstimatedOutputSize() {
+                return this.oqEstimate?.output_size_formatted || '';
+            },
+
+            oqRefreshEstimate() {
+                // Debounce: wait 300ms after last change
+                if (this._oqEstimateTimer) clearTimeout(this._oqEstimateTimer);
+                if (!this.oqSelectedModelPath) {
+                    this.oqEstimate = null;
+                    return;
+                }
+                this._oqEstimateTimer = setTimeout(async () => {
+                    try {
+                        const params = new URLSearchParams({
+                            model_path: this.oqSelectedModelPath,
+                            oq_level: this.oqLevel,
+                        });
+                        const resp = await fetch(`/admin/api/oq/estimate?${params}`);
+                        if (resp.ok) {
+                            this.oqEstimate = await resp.json();
+                        }
+                    } catch (e) {
+                        console.error('Failed to estimate oQ:', e);
+                    }
+                }, 300);
+            },
+
+            // =================================================================
             // Recommended Models Functions
             // =================================================================
 
@@ -2153,7 +2809,7 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
-                    const response = await fetch('/admin/api/hf/recommended', { signal: controller.signal });
+                    const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         this.hfRecommended = await response.json();
                         this.hfRecommendedLoaded = true;
@@ -2239,6 +2895,7 @@
                         q: this.hfSearchQuery,
                         sort: this.hfSearchSort,
                         limit: '100',
+                        mlx_only: this.hfMlxOnly,
                     });
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
@@ -2529,7 +3186,7 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 20000);
                 try {
-                    const response = await fetch('/admin/api/ms/recommended', { signal: controller.signal });
+                    const response = await fetch(`/admin/api/ms/recommended?mlx_only=${this.msMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
                         this.msRecommended = data;
@@ -2596,6 +3253,7 @@
                         q: this.msSearchQuery,
                         sort: this.msSearchSort,
                         limit: '50',
+                        mlx_only: this.msMlxOnly,
                     });
                     const response = await fetch(`/admin/api/ms/search?${params}`, { signal: controller.signal });
                     if (response.ok) {

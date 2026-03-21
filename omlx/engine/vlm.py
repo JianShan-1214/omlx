@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens
+from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..models.vlm import VLMModelAdapter
 from ..utils.image import (
     compute_image_hash,
@@ -146,12 +146,14 @@ class VLMBatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
+        model_settings: Any | None = None,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
+        self._model_settings = model_settings
 
         self._vlm_model = None
         self._processor = None
@@ -263,6 +265,25 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # SpecPrefill: load draft model and pass to scheduler
+        if self._model_settings is not None:
+            specprefill_draft = getattr(self._model_settings, "specprefill_draft_model", None)
+            specprefill_enabled = getattr(self._model_settings, "specprefill_enabled", False)
+            if specprefill_enabled and specprefill_draft:
+                try:
+                    from mlx_lm import load as mlx_lm_load
+
+                    def _load_draft():
+                        draft_model, _ = mlx_lm_load(specprefill_draft)
+                        return draft_model
+                    draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)
+                    self._engine.engine.scheduler.set_specprefill_draft_model(
+                        draft_model, draft_model_name=specprefill_draft
+                    )
+                    logger.info(f"SpecPrefill: draft model loaded ({specprefill_draft})")
+                except Exception as e:
+                    logger.error(f"SpecPrefill: draft model load failed: {e}")
 
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)
@@ -471,6 +492,8 @@ class VLMBatchedEngine(BaseEngine):
                 return_messages=True,
             )
 
+        # Strip partial field from messages (VLM always uses add_generation_prompt=True)
+        detect_and_strip_partial(formatted_messages)
         template_kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
@@ -559,6 +582,8 @@ class VLMBatchedEngine(BaseEngine):
     ) -> str:
         """Apply chat template for text-only messages (no images)."""
         if hasattr(self._tokenizer, "apply_chat_template"):
+            # Strip partial field (VLM always uses add_generation_prompt=True)
+            detect_and_strip_partial(messages)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
@@ -688,12 +713,22 @@ class VLMBatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
         )
 
+        # SpecPrefill: pass per-request overrides
+        specprefill_kwargs = {}
+        if kwargs.get("specprefill") is not None:
+            specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
+        if kwargs.get("specprefill_keep_pct") is not None:
+            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+        if kwargs.get("specprefill_system_end") is not None:
+            specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
+
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            **specprefill_kwargs,
         )
 
         finished_normally = False
@@ -785,6 +820,24 @@ class VLMBatchedEngine(BaseEngine):
             self._engine._mlx_executor,
             self._process_chat_messages, messages, tools, kwargs,
         )
+
+        # SpecPrefill: compute system prompt token count for protection.
+        # Can't template system-only messages (most templates require user),
+        # so compute by subtracting non-system from full prompt tokens.
+        if kwargs.get("specprefill") is not False:
+            non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
+            if len(non_system) < len(messages) and non_system:
+                try:
+                    non_system_prompt = self._tokenizer.apply_chat_template(
+                        non_system, tokenize=False, add_generation_prompt=True,
+                    )
+                    full_tokens = len(self._tokenizer.encode(prompt))
+                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+                    system_end = full_tokens - non_system_tokens
+                    if system_end > 0:
+                        kwargs["specprefill_system_end"] = system_end
+                except Exception as e:
+                    logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
         async for output in self.stream_generate(
             prompt=prompt,

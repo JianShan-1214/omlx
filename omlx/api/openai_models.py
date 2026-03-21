@@ -65,6 +65,10 @@ class Message(BaseModel):
     tool_calls: Optional[List[dict]] = None
     # For tool response messages (role="tool")
     tool_call_id: Optional[str] = None
+    # Participant name, rendered into chat template (e.g. Kimi K2/K2.5 named assistants)
+    name: Optional[str] = None
+    # Continue from this message instead of starting a new turn (prefill / partial mode)
+    partial: bool = False
 
 
 # =============================================================================
@@ -149,6 +153,10 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = None
+    # SpecPrefill: per-request enable/disable (None = use model setting)
+    specprefill: Optional[bool] = None
+    # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
+    specprefill_keep_pct: Optional[float] = None
 
     @field_validator("stop", mode="before")
     @classmethod

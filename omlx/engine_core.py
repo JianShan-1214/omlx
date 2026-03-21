@@ -253,6 +253,9 @@ class EngineCore:
         vlm_inputs_embeds: Optional[Any] = None,
         vlm_extra_kwargs: Optional[Dict[str, Any]] = None,
         vlm_image_hash: Optional[str] = None,
+        specprefill: Optional[bool] = None,
+        specprefill_keep_pct: Optional[float] = None,
+        specprefill_system_end: Optional[int] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -266,6 +269,8 @@ class EngineCore:
             vlm_inputs_embeds: Pre-computed vision+text embeddings for VLM
             vlm_extra_kwargs: Model-specific VLM kwargs (e.g., position_ids)
             vlm_image_hash: SHA256 hash of images for prefix cache
+            specprefill: Per-request SpecPrefill override (True/False/None)
+            specprefill_keep_pct: Per-request keep rate override
 
         Returns:
             The request ID
@@ -286,6 +291,18 @@ class EngineCore:
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
         )
+
+        # SpecPrefill: resolve per-request settings.
+        # The scheduler checks _specprefill_enabled to decide whether to score.
+        if specprefill is not None:
+            request._specprefill_enabled = specprefill
+        elif self.scheduler._specprefill_draft_model is not None:
+            # Draft model is loaded → enable by default
+            request._specprefill_enabled = True
+        if specprefill_keep_pct is not None:
+            request._specprefill_keep_pct = specprefill_keep_pct
+        if specprefill_system_end is not None and specprefill_system_end > 0:
+            request.specprefill_system_end = specprefill_system_end
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)

@@ -302,6 +302,7 @@ async def lifespan(app: FastAPI):
                 engine_pool=_server_state.engine_pool,
                 max_bytes=max_bytes,
                 settings_manager=_server_state.settings_manager,
+                prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
             )
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -426,13 +427,21 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
-    logger.warning(
-        "%s %s → %d: %s",
-        request.method,
-        request.url.path,
-        exc.status_code,
-        exc.detail,
+    # Admin session expiry from dashboard polling — not worth logging.
+    # But keep /admin/api/login 401s visible (possible brute force attempts).
+    _is_admin_session_expiry = (
+        request.url.path.startswith("/admin/")
+        and request.url.path != "/admin/api/login"
+        and exc.status_code == 401
     )
+    if not _is_admin_session_expiry:
+        logger.warning(
+            "%s %s → %d: %s",
+            request.method,
+            request.url.path,
+            exc.status_code,
+            exc.detail,
+        )
     if _is_api_route(request):
         content = _openai_error_body(exc.detail, exc.status_code)
     else:
@@ -1147,6 +1156,17 @@ def init_server(
     except ImportError:
         logger.info("ModelScope support not available")
 
+    # Initialize oQ Quantizer
+    from .admin.oq_manager import OQManager
+    from .admin.routes import set_oq_manager
+
+    _server_state.oq_manager = OQManager(
+        model_dirs=[str(d) for d in dir_list],
+        on_complete=_refresh_models_after_download,
+    )
+    set_oq_manager(_server_state.oq_manager)
+    logger.info("oQ Quantizer initialized")
+
 
 _KEEPALIVE_SENTINEL = object()
 
@@ -1462,6 +1482,12 @@ async def create_embeddings(
     - float or base64 encoding format
     - Optional dimension reduction (with renormalization)
     """
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     engine = await get_embedding_engine(request.model)
 
     # Normalize input to list
@@ -1558,6 +1584,12 @@ async def create_rerank(
     - Optional top_n to limit results
     - Optional return_documents to include document text in response
     """
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     engine = await get_reranker_engine(request.model)
 
     # Normalize documents to list of strings
@@ -1612,6 +1644,11 @@ async def create_completion(
     _: bool = Depends(verify_api_key),
 ):
     """Create a text completion."""
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
@@ -1631,6 +1668,7 @@ async def create_completion(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming response with timing
@@ -1693,8 +1731,9 @@ async def create_completion(
         model=request.model,
         choices=choices,
         usage=Usage(
+            prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
-            total_tokens=total_completion_tokens,
+            total_tokens=total_prompt_tokens + total_completion_tokens,
         ),
     )
 
@@ -1732,6 +1771,13 @@ async def create_chat_completion(
         for i, msg in enumerate(request.messages):
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
             logger.log(5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview)
+
+    # Block inference during quantization to prevent GPU Metal errors
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
 
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
@@ -1842,6 +1888,12 @@ async def create_chat_completion(
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
+    # SpecPrefill: per-request overrides
+    if request.specprefill is not None:
+        chat_kwargs["specprefill"] = request.specprefill
+    if request.specprefill_keep_pct is not None:
+        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
@@ -1849,6 +1901,7 @@ async def create_chat_completion(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming response with timing
@@ -2677,6 +2730,12 @@ async def create_anthropic_message(
         f"max_tokens={request.max_tokens}"
     )
 
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     engine = await get_engine_for_model(request.model)
 
     # Resolve alias to real model ID for settings lookups
@@ -2801,6 +2860,7 @@ async def create_anthropic_message(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming response
@@ -2891,6 +2951,12 @@ async def count_anthropic_tokens(
 
     This is compatible with Anthropic's token counting API.
     """
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     engine = await get_engine_for_model(request.model)
 
     # Convert Anthropic format to internal format
@@ -2995,6 +3061,12 @@ async def create_response(
     _: bool = Depends(verify_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
     logger.debug(
         f"Responses API request: model={request.model}, stream={request.stream}"
     )
@@ -3132,6 +3204,7 @@ async def create_response(
                 http_request=http_request,
             ),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Non-streaming
