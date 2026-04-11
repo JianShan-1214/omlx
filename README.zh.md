@@ -51,7 +51,7 @@
 
 ### macOS 应用
 
-从 [Releases](https://github.com/jundot/omlx/releases) 下载 `.dmg`，拖到 Applications 即可。应用支持自动更新，后续升级只需一键完成。
+从 [Releases](https://github.com/jundot/omlx/releases) 下载 `.dmg`，拖到 Applications 即可。应用支持自动更新，后续升级只需一键完成。macOS 应用不包含 `omlx` CLI 命令。如需在终端使用，请通过 Homebrew 或从源码安装。
 
 ### Homebrew
 
@@ -78,13 +78,13 @@ pip install -e .          # 仅核心
 pip install -e ".[mcp]"   # 含 MCP（Model Context Protocol）支持
 ```
 
-需要 Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4）。
+需要 macOS 15.0+ (Sequoia), Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4）。
 
 ## 快速开始
 
 ### macOS 应用
 
-从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。
+从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。要连接 OpenClaw、OpenCode 或 Codex，请参阅[集成](#集成)。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX 欢迎界面" width="360">
@@ -145,7 +145,7 @@ brew services info omlx     # 查看状态
 
 ### 连续批处理
 
-通过 mlx-lm 的 BatchGenerator 处理并发请求。预填充和补全批大小可配置。
+通过 mlx-lm 的 BatchGenerator 处理并发请求。最大并发请求数可通过 CLI 或管理面板配置。
 
 ### Claude Code 优化
 
@@ -187,6 +187,14 @@ brew services info omlx     # 查看状态
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX 模型下载器" width="720">
+</p>
+
+### 集成
+
+在管理后台中一键设置 OpenClaw、OpenCode 和 Codex。无需手动编辑配置文件。
+
+<p align="center">
+  <img src="docs/images/omlx_integrations.png" alt="oMLX 集成" width="720">
 </p>
 
 ### 性能基准测试
@@ -233,7 +241,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 
-上表未列出的模型，只要聊天模板支持 `tools` 参数且输出采用可识别的 `<tool_call>` XML 格式，也有可能正常工作。包含工具调用的流式请求会缓冲全部内容，在完成后统一返回结果。
+上表未列出的模型，只要聊天模板支持 `tools` 参数且输出采用可识别的 `<tool_call>` XML 格式，也有可能正常工作。针对支持工具调用的流式请求，系统会增量发射助手文本，同时隐藏已知的工具调用控制标记；结构化工具调用将在完成整个回合解析后发射。
 
 ## 模型
 
@@ -273,11 +281,14 @@ omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
 # 设置内存热缓存大小
 omlx serve --model-dir ~/models --hot-cache-max-size 20%
 
-# 调整批大小
-omlx serve --model-dir ~/models --prefill-batch-size 8 --completion-batch-size 32
+# 调整最大并发请求数（默认: 8）
+omlx serve --model-dir ~/models --max-concurrent-requests 16
 
 # 使用 MCP 工具
 omlx serve --model-dir ~/models --mcp-config mcp.json
+
+# HuggingFace 镜像端点（适用于受限地区）
+omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 
 # API 密钥认证
 omlx serve --model-dir ~/models --api-key your-secret-key
@@ -300,7 +311,7 @@ FastAPI Server (OpenAI / Anthropic API)
     │
     ├── ProcessMemoryEnforcer (总内存限制、TTL 检查)
     │
-    ├── Scheduler (FCFS，可配置批大小)
+    ├── Scheduler (FCFS，可配置并发数)
     │   └── mlx-lm BatchGenerator
     │
     └── Cache Stack

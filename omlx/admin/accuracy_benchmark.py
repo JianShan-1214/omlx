@@ -32,7 +32,11 @@ _current_run_id: Optional[str] = None
 _current_model: Optional[str] = None
 _engine_pool_ref: Any = None
 
-VALID_BENCHMARKS = ["mmlu", "hellaswag", "truthfulqa", "gsm8k", "livecodebench"]
+VALID_BENCHMARKS = [
+    "mmlu", "kmmlu", "cmmlu", "jmmlu",
+    "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
+    "gsm8k", "humaneval", "mbpp", "livecodebench",
+]
 
 
 class AccuracyBenchmarkRequest(BaseModel):
@@ -41,12 +45,13 @@ class AccuracyBenchmarkRequest(BaseModel):
     model_id: str
     benchmarks: dict[str, int]  # name -> sample_size (0 = full dataset)
     batch_size: int = 1
+    enable_thinking: bool = False
 
     @field_validator("batch_size")
     @classmethod
     def validate_batch_size(cls, v: int) -> int:
-        if v not in (1, 2, 4, 8):
-            raise ValueError("batch_size must be 1, 2, 4, or 8")
+        if v not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("batch_size must be 1, 2, 4, 8, 16, or 32")
         return v
 
     @field_validator("benchmarks")
@@ -272,6 +277,9 @@ async def run_accuracy_benchmark(
     from ..eval import BENCHMARKS
 
     request = run.request
+
+    # Suppress TTL auto-unload during benchmark
+    engine_pool._suppress_ttl = True
     start_time = time.time()
 
     try:
@@ -304,7 +312,9 @@ async def run_accuracy_benchmark(
             "total": len(request.benchmarks),
         })
 
-        engine = await engine_pool.get_engine(request.model_id)
+        # Force LM engine for accuracy benchmarks — text-only tasks
+        # don't need VLM and the VLM adapter can produce empty responses.
+        engine = await engine_pool.get_engine(request.model_id, force_lm=True)
 
         # Load model sampling settings
         sampling_kwargs = {}
@@ -394,6 +404,7 @@ async def run_accuracy_benchmark(
                     engine, items, on_progress,
                     batch_size=request.batch_size,
                     sampling_kwargs=sampling_kwargs,
+                    enable_thinking=request.enable_thinking,
                 )
             except asyncio.CancelledError:
                 run.status = "cancelled"
@@ -417,6 +428,7 @@ async def run_accuracy_benchmark(
                 "model_id": request.model_id,
                 "benchmark": result.benchmark_name,
                 "accuracy": round(result.accuracy, 4),
+                "thinking_used": result.thinking_used,
                 "total": result.total_questions,
                 "correct": result.correct_count,
                 "time_s": round(result.time_seconds, 1),
@@ -482,3 +494,6 @@ async def run_accuracy_benchmark(
             "type": "error",
             "message": str(e),
         })
+    finally:
+        # Re-enable TTL auto-unload
+        engine_pool._suppress_ttl = False

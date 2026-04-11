@@ -107,6 +107,7 @@ from .api.embedding_models import (
 )
 from .api.embedding_utils import (
     encode_embedding_base64,
+    normalize_embedding_items,
     truncate_embedding,
     normalize_input,
 )
@@ -149,7 +150,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, extract_harmony_messages, extract_multimodal_content, extract_text_content
+from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -219,6 +220,8 @@ class ServerState:
     ms_downloader: Optional[object] = None  # MSDownloader
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
     responses_store: ResponseStore = field(default_factory=ResponseStore)
+    oq_manager: Optional[object] = None  # OQManager
+    hf_uploader: Optional[object] = None  # HFUploader
 
 
 # Global server state instance
@@ -243,11 +246,13 @@ def get_mcp_manager():
 
 
 async def verify_api_key(
+    request: FastAPIRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
     """Verify API key if configured.
 
     Checks the provided Bearer token against the main API key and all sub keys.
+    Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
     from .admin.auth import verify_any_api_key
 
@@ -263,9 +268,14 @@ async def verify_api_key(
     ):
         return True
 
-    # Check if credentials provided
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="API key required")
+    # Extract API key from Bearer token or x-api-key header
+    if credentials is not None:
+        api_key_value = credentials.credentials
+    else:
+        # Fallback: check x-api-key header (Anthropic SDK compatibility)
+        api_key_value = request.headers.get("x-api-key")
+        if api_key_value is None:
+            raise HTTPException(status_code=401, detail="API key required")
 
     # Check main key and sub keys
     sub_keys = (
@@ -273,10 +283,8 @@ async def verify_api_key(
         if _server_state.global_settings is not None
         else []
     )
-    if not verify_any_api_key(
-        credentials.credentials, _server_state.api_key, sub_keys
-    ):
-        logger.warning("Rejected API key: %r", credentials.credentials)
+    if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
+        logger.warning("Rejected API key: %r", api_key_value)
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True
@@ -375,6 +383,17 @@ app = FastAPI(
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
 app.include_router(mcp_router)
+
+# Include audio routes only when mlx-audio is installed.
+# audio_routes.py itself only imports fastapi/stdlib at module level, so it
+# would always import successfully — we need an explicit mlx-audio check.
+try:
+    import mlx_audio as _  # noqa: F401
+    from .api.audio_routes import router as audio_router
+    app.include_router(audio_router)
+    del _
+except ImportError:
+    pass
 
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
@@ -712,7 +731,9 @@ def get_sampling_params(
     req_frequency_penalty: float | None = None,
     req_max_tokens: int | None = None,
     ocr_defaults: dict | None = None,
-) -> tuple[float, float, int, float, float, float, float, int]:
+    req_xtc_probability: float | None = None,
+    req_xtc_threshold: float | None = None,
+) -> tuple[float, float, int, float, float, float, float, int, float, float]:
     """
     Get effective sampling parameters with per-model settings support.
 
@@ -721,7 +742,7 @@ def get_sampling_params(
     - Otherwise: request > model settings > ocr_defaults > global defaults
 
     Returns:
-        tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens)
+        tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold)
     """
     global_sampling = _server_state.sampling
 
@@ -833,14 +854,21 @@ def get_sampling_params(
         else:
             max_tokens = global_sampling.max_tokens
 
+    # XTC probability: request > default (0.0 = disabled)
+    xtc_probability = req_xtc_probability if req_xtc_probability is not None else 0.0
+
+    # XTC threshold: request > default (0.1 = safe default when probability is set)
+    xtc_threshold = req_xtc_threshold if req_xtc_threshold is not None else 0.1
+
     logger.debug(
         f"Sampling params: temperature={temperature}, top_p={top_p}, top_k={top_k}, "
         f"repetition_penalty={repetition_penalty}, min_p={min_p}, presence_penalty={presence_penalty}, "
-        f"frequency_penalty={frequency_penalty}, max_tokens={max_tokens}"
+        f"frequency_penalty={frequency_penalty}, max_tokens={max_tokens}, "
+        f"xtc_probability={xtc_probability}, xtc_threshold={xtc_threshold}"
         f"{' (forced)' if force else ''}"
         f"{f' (model: {model_id})' if model_id else ''}"
     )
-    return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens
+    return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold
 
 
 def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
@@ -1018,7 +1046,7 @@ def init_server(
             logger.info("Generated and saved new auth secret key")
         from .admin.auth import init_auth
 
-        init_auth(global_settings.auth.secret_key)
+        init_auth(global_settings.auth.secret_key, lambda: _server_state.global_settings)
 
     # Configure CORS middleware from settings
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
@@ -1167,6 +1195,16 @@ def init_server(
     set_oq_manager(_server_state.oq_manager)
     logger.info("oQ Quantizer initialized")
 
+    # Initialize HuggingFace uploader
+    from .admin.hf_uploader import HFUploader
+    from .admin.routes import set_hf_uploader
+
+    _server_state.hf_uploader = HFUploader(
+        model_dirs=[str(d) for d in dir_list],
+    )
+    set_hf_uploader(_server_state.hf_uploader)
+    logger.info("HF Uploader initialized")
+
 
 _KEEPALIVE_SENTINEL = object()
 
@@ -1241,7 +1279,14 @@ async def _with_sse_keepalive(
                     keepalive_elapsed = 0.0
                     yield ": keep-alive\n\n"
             if task.done():
-                result = task.result()
+                try:
+                    result = task.result()
+                except Exception as e:
+                    logger.error(f"SSE generator error: {e}")
+                    error_data = {"error": {"message": str(e), "type": "server_error"}}
+                    yield f"data: {json.dumps(error_data)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 if result is _KEEPALIVE_SENTINEL:
                     return
                 yield result
@@ -1283,6 +1328,59 @@ async def _run_with_disconnect_guard(
                 pass
             return None
     return task.result()
+
+
+async def _with_json_keepalive(
+    http_request: FastAPIRequest,
+    coro,
+    interval: float = 10.0,
+    disconnect_poll: float = 2.0,
+) -> AsyncIterator[str]:
+    """Wrap a coroutine to send keepalive spaces while waiting for completion.
+
+    For non-streaming requests, the HTTP response body is buffered until
+    generation finishes, causing client read timeouts on long prefills.
+    This wrapper uses StreamingResponse to send space characters as
+    keepalive. JSON parsers ignore leading whitespace, so the final
+    response parses normally.
+    """
+    task = asyncio.ensure_future(coro)
+    keepalive_elapsed = 0.0
+
+    yield " "
+
+    try:
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=disconnect_poll)
+            if done:
+                break
+            if http_request is not None:
+                try:
+                    disconnected = await http_request.is_disconnected()
+                    if disconnected:
+                        logger.info("Client disconnected during non-streaming response, cancelling")
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, StopAsyncIteration):
+                            pass
+                        return
+                except Exception:
+                    pass
+            keepalive_elapsed += disconnect_poll
+            if keepalive_elapsed >= interval:
+                keepalive_elapsed = 0.0
+                yield " "
+        result = task.result()
+        if result is not None:
+            yield result
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
 
 
 @app.get("/health")
@@ -1461,8 +1559,9 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
 @app.post("/v1/embeddings")
 async def create_embeddings(
     request: EmbeddingRequest,
+    http_request: FastAPIRequest,
     _: bool = Depends(verify_api_key),
-) -> EmbeddingResponse:
+):
     """
     Create embeddings for input text(s).
 
@@ -1482,7 +1581,8 @@ async def create_embeddings(
     - float or base64 encoding format
     - Optional dimension reduction (with renormalization)
     """
-    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+    oq_manager = getattr(_server_state, "oq_manager", None)
+    if oq_manager and oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
@@ -1490,50 +1590,60 @@ async def create_embeddings(
 
     engine = await get_embedding_engine(request.model)
 
-    # Normalize input to list
-    texts = normalize_input(request.input)
+    if request.items is not None:
+        embedding_inputs = normalize_embedding_items(request.items)
+    elif request.input is not None:
+        embedding_inputs = normalize_input(request.input)
+    else:
+        embedding_inputs = []
 
-    if not texts:
+    if not embedding_inputs:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
-    # Generate embeddings
-    start_time = time.perf_counter()
+    async def _build_embeddings():
+        start_time = time.perf_counter()
+        try:
+            output = await engine.embed(embedding_inputs)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except TypeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-    output = await engine.embed(texts)
-
-    elapsed = time.perf_counter() - start_time
-    logger.info(
-        f"Embedding: {len(texts)} texts, {output.dimensions} dims, "
-        f"{output.total_tokens} tokens in {elapsed:.3f}s"
-    )
-
-    # Format response
-    data = []
-    for i, embedding in enumerate(output.embeddings):
-        # Apply dimension truncation if specified
-        if request.dimensions and request.dimensions < len(embedding):
-            embedding = truncate_embedding(embedding, request.dimensions)
-
-        # Apply encoding format
-        if request.encoding_format == "base64":
-            formatted_embedding = encode_embedding_base64(embedding)
-        else:
-            formatted_embedding = embedding
-
-        data.append(
-            EmbeddingData(
-                index=i,
-                embedding=formatted_embedding,
-            )
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
+            f"{output.total_tokens} tokens in {elapsed:.3f}s"
         )
 
-    return EmbeddingResponse(
-        data=data,
-        model=request.model,
-        usage=EmbeddingUsage(
-            prompt_tokens=output.total_tokens,
-            total_tokens=output.total_tokens,
-        ),
+        data = []
+        for i, embedding in enumerate(output.embeddings):
+            if request.dimensions and request.dimensions < len(embedding):
+                embedding = truncate_embedding(embedding, request.dimensions)
+
+            if request.encoding_format == "base64":
+                formatted_embedding = encode_embedding_base64(embedding)
+            else:
+                formatted_embedding = embedding
+
+            data.append(
+                EmbeddingData(
+                    index=i,
+                    embedding=formatted_embedding,
+                )
+            )
+
+        return EmbeddingResponse(
+            data=data,
+            model=request.model,
+            usage=EmbeddingUsage(
+                prompt_tokens=output.total_tokens,
+                total_tokens=output.total_tokens,
+            ),
+        ).model_dump_json()
+
+    return StreamingResponse(
+        _with_json_keepalive(http_request, _build_embeddings()),
+        media_type="application/json",
     )
 
 
@@ -1671,25 +1781,26 @@ async def create_completion(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    # Non-streaming response with timing
-    start_time = time.perf_counter()
-    choices = []
-    total_completion_tokens = 0
-    total_prompt_tokens = 0
-    total_cached_tokens = 0
+    # Non-streaming response with keepalive during prefill
+    async def _build_completion():
+        start_time = time.perf_counter()
+        choices = []
+        total_completion_tokens = 0
+        total_prompt_tokens = 0
+        total_cached_tokens = 0
 
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
-        request.temperature, request.top_p, request.model,
-        req_min_p=getattr(request, 'min_p', None),
-        req_presence_penalty=getattr(request, 'presence_penalty', None),
-        req_frequency_penalty=getattr(request, 'frequency_penalty', None),
-        req_max_tokens=request.max_tokens,
-    )
+        temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
+            request.temperature, request.top_p, request.model,
+            req_min_p=getattr(request, 'min_p', None),
+            req_presence_penalty=getattr(request, 'presence_penalty', None),
+            req_frequency_penalty=getattr(request, 'frequency_penalty', None),
+            req_max_tokens=request.max_tokens,
+            req_xtc_probability=getattr(request, 'xtc_probability', None),
+            req_xtc_threshold=getattr(request, 'xtc_threshold', None),
+        )
 
-    for i, prompt in enumerate(prompts):
-        output = await _run_with_disconnect_guard(
-            http_request,
-            engine.generate(
+        for i, prompt in enumerate(prompts):
+            output = await engine.generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -1699,42 +1810,46 @@ async def create_completion(
                 repetition_penalty=repetition_penalty,
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
+                xtc_probability=xtc_probability,
+                xtc_threshold=xtc_threshold,
                 stop=request.stop,
-            ),
-        )
-        if output is None:
-            return  # Client disconnected
+                seed=request.seed,
+            )
 
-        choices.append(CompletionChoice(
-            index=i,
-            text=output.text,
-            finish_reason=output.finish_reason,
-        ))
-        total_completion_tokens += output.completion_tokens
-        total_prompt_tokens += output.prompt_tokens
-        total_cached_tokens += output.cached_tokens
+            choices.append(CompletionChoice(
+                index=i,
+                text=output.text,
+                finish_reason=output.finish_reason,
+            ))
+            total_completion_tokens += output.completion_tokens
+            total_prompt_tokens += output.prompt_tokens
+            total_cached_tokens += output.cached_tokens
 
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
 
-    # Record metrics
-    get_server_metrics().record_request_complete(
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        cached_tokens=total_cached_tokens,
-        generation_duration=elapsed,
-        model_id=request.model,
-    )
-
-    return CompletionResponse(
-        model=request.model,
-        choices=choices,
-        usage=Usage(
+        get_server_metrics().record_request_complete(
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
-            total_tokens=total_prompt_tokens + total_completion_tokens,
-        ),
+            cached_tokens=total_cached_tokens,
+            generation_duration=elapsed,
+            model_id=request.model,
+        )
+
+        return CompletionResponse(
+            model=request.model,
+            choices=choices,
+            usage=Usage(
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                total_tokens=total_prompt_tokens + total_completion_tokens,
+            ),
+        ).model_dump_json()
+
+    return StreamingResponse(
+        _with_json_keepalive(http_request, _build_completion()),
+        media_type="application/json",
     )
 
 
@@ -1790,9 +1905,11 @@ async def create_chat_completion(
     max_tool_result_tokens = None
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
+    reasoning_parser = None
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(resolved_model)
         max_tool_result_tokens = ms.max_tool_result_tokens
+        reasoning_parser = ms.reasoning_parser
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
@@ -1804,10 +1921,9 @@ async def create_chat_completion(
 
     # Extract messages - different engines need different content handling
     is_vlm = isinstance(engine, VLMBatchedEngine)
-    if engine.model_type == "gpt_oss":
-        messages = extract_harmony_messages(
-            request.messages, max_tool_result_tokens, engine.tokenizer
-        )
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
     elif is_vlm:
         # VLM: preserve image_url content parts for vision processing
         messages = extract_multimodal_content(
@@ -1818,12 +1934,22 @@ async def create_chat_completion(
             request.messages, max_tool_result_tokens, engine.tokenizer
         )
 
-    # Handle response_format - inject system prompt if needed
+    # Compile grammar for structured output (logit-level enforcement).
+    # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
     response_format = request.response_format
-    if response_format:
+    if request.structured_outputs is not None or response_format:
+        await engine.start()
+    compiled_grammar = _compile_grammar_for_request(
+        engine,
+        structured_outputs=request.structured_outputs,
+        response_format=response_format,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        reasoning_parser=reasoning_parser,
+    )
+    # Fall back to prompt injection when grammar is not compiled
+    if compiled_grammar is None and response_format:
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
-            # Inject JSON instruction into messages
             messages = _inject_json_instruction(messages, json_instruction)
 
     # Merge MCP tools with user-provided tools
@@ -1857,12 +1983,14 @@ async def create_chat_completion(
     validate_context_window(num_prompt_tokens, request.model)
 
     # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
         req_max_tokens=request.max_tokens,
+        req_xtc_probability=getattr(request, 'xtc_probability', None),
+        req_xtc_threshold=getattr(request, 'xtc_threshold', None),
     )
     chat_kwargs = {
         "max_tokens": max_tokens,
@@ -1873,12 +2001,32 @@ async def create_chat_completion(
         "repetition_penalty": repetition_penalty,
         "presence_penalty": presence_penalty,
         "frequency_penalty": frequency_penalty,
+        "xtc_probability": xtc_probability,
+        "xtc_threshold": xtc_threshold,
     }
+
+    # Add seed for reproducible generation (best-effort)
+    if request.seed is not None:
+        chat_kwargs["seed"] = request.seed
 
     # Add thinking budget if applicable
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
+
+    # Add compiled grammar for logit-level structured output.
+    # When a reasoning_parser is configured, the structural tag includes
+    # a thinking phase — auto-set a thinking_budget so the model exits
+    # the reasoning phase and the grammar can activate.
+    if compiled_grammar is not None:
+        chat_kwargs["compiled_grammar"] = compiled_grammar
+        if reasoning_parser and "thinking_budget" not in chat_kwargs:
+            default_budget = min(max_tokens // 2, 4096)
+            chat_kwargs["thinking_budget"] = default_budget
+            logger.debug(
+                "Auto-set thinking_budget=%d for grammar-constrained request",
+                default_budget,
+            )
 
     # Add tools if provided (includes MCP tools)
     if tools_for_template:
@@ -1888,11 +2036,17 @@ async def create_chat_completion(
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
-    # SpecPrefill: per-request overrides
+    # SpecPrefill: per-request overrides (fall back to model_settings)
     if request.specprefill is not None:
         chat_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    elif _server_state.settings_manager and ms.specprefill_keep_pct is not None:
+        chat_kwargs["specprefill_keep_pct"] = ms.specprefill_keep_pct
+    if getattr(request, "specprefill_threshold", None) is not None:
+        chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
+    elif _server_state.settings_manager and ms.specprefill_threshold is not None:
+        chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
 
     if request.stream:
         return StreamingResponse(
@@ -1904,94 +2058,89 @@ async def create_chat_completion(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    # Non-streaming response with timing
-    start_time = time.perf_counter()
+    # Non-streaming response with keepalive during prefill
+    async def _build_chat_completion():
+        start_time = time.perf_counter()
 
-    output = await _run_with_disconnect_guard(
-        http_request,
-        engine.chat(messages=messages, **chat_kwargs),
-    )
-    if output is None:
-        return  # Client disconnected
+        output = await engine.chat(messages=messages, **chat_kwargs)
 
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
 
-    # Record metrics
-    get_server_metrics().record_request_complete(
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-        cached_tokens=output.cached_tokens,
-        generation_duration=elapsed,
-        model_id=request.model,
-    )
-
-    # Separate thinking from content
-    raw_text = clean_special_tokens(output.text) if output.text else ""
-    thinking_content, regular_content = extract_thinking(raw_text)
-    cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
-
-    # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
-    # For other models, parse from text output
-    if engine.model_type == "gpt_oss" and output.tool_calls:
-        # Harmony model with tool calls - convert format
-        from .api.openai_models import ToolCall, FunctionCall
-        tool_calls = [
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                ),
-            )
-            for tc in output.tool_calls
-        ]
-        cleaned_text = regular_content
-    else:
-        # Parse tool calls from regular content, falling back to thinking
-        # content for small models that emit tool calls inside <think> blocks
-        extraction = extract_tool_calls_with_thinking(
-            thinking_content,
-            regular_content,
-            tokenizer=engine.tokenizer,
-            tools=tools_for_template,
-        )
-        cleaned_text = extraction.cleaned_text
-        tool_calls = extraction.tool_calls
-        cleaned_thinking = extraction.cleaned_thinking
-
-    # Process response_format if specified
-    if response_format and not tool_calls:
-        cleaned_text, parsed_json, is_valid, error = parse_json_output(
-            cleaned_text or regular_content,
-            response_format
-        )
-        if parsed_json is not None:
-            # Return JSON as string
-            cleaned_text = json.dumps(parsed_json)
-        if not is_valid:
-            logger.warning(f"JSON validation failed: {error}")
-
-    # Determine finish reason
-    finish_reason = "tool_calls" if tool_calls else output.finish_reason
-
-    return ChatCompletionResponse(
-        model=request.model,
-        choices=[ChatCompletionChoice(
-            message=AssistantMessage(
-                content=cleaned_text.strip() if cleaned_text else None,
-                reasoning_content=cleaned_thinking if cleaned_thinking else None,
-                tool_calls=tool_calls,
-            ),
-            finish_reason=finish_reason,
-        )],
-        usage=Usage(
+        get_server_metrics().record_request_complete(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
-            total_tokens=output.prompt_tokens + output.completion_tokens,
-        ),
+            cached_tokens=output.cached_tokens,
+            generation_duration=elapsed,
+            model_id=request.model,
+        )
+
+        # Separate thinking from content
+        raw_text = clean_special_tokens(output.text) if output.text else ""
+        thinking_content, regular_content = extract_thinking(raw_text)
+        cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
+
+        # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
+        # For other models, parse from text output
+        if engine.model_type == "gpt_oss" and output.tool_calls:
+            from .api.openai_models import ToolCall, FunctionCall
+            tool_calls = [
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=tc["name"],
+                        arguments=tc["arguments"],
+                    ),
+                )
+                for tc in output.tool_calls
+            ]
+            cleaned_text = regular_content
+        else:
+            extraction = extract_tool_calls_with_thinking(
+                thinking_content,
+                regular_content,
+                tokenizer=engine.tokenizer,
+                tools=tools_for_template,
+            )
+            cleaned_text = extraction.cleaned_text
+            tool_calls = extraction.tool_calls
+            cleaned_thinking = extraction.cleaned_thinking
+
+        # Process response_format if specified
+        if response_format and not tool_calls:
+            cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text or regular_content,
+                response_format
+            )
+            if parsed_json is not None:
+                cleaned_text = json.dumps(parsed_json)
+            if not is_valid:
+                logger.warning(f"JSON validation failed: {error}")
+
+        finish_reason = "tool_calls" if tool_calls else output.finish_reason
+
+        return ChatCompletionResponse(
+            model=request.model,
+            choices=[ChatCompletionChoice(
+                message=AssistantMessage(
+                    content=cleaned_text.strip() if cleaned_text else None,
+                    reasoning_content=cleaned_thinking if cleaned_thinking else None,
+                    tool_calls=tool_calls,
+                ),
+                finish_reason=finish_reason,
+            )],
+            usage=Usage(
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
+                total_tokens=output.prompt_tokens + output.completion_tokens,
+            ),
+        ).model_dump_json()
+
+    return StreamingResponse(
+        _with_json_keepalive(http_request, _build_chat_completion()),
+        media_type="application/json",
     )
 
 
@@ -2027,6 +2176,199 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
     return messages
 
 
+def _build_format_element(structured_outputs=None, response_format=None):
+    """Build an xgrammar structural-tag format element from the request.
+
+    Returns a format dict (e.g. ``{"type": "json_schema", ...}``) suitable
+    for embedding in a structural tag, or ``None`` if no grammar is needed.
+    Also returns ``"bare"`` compilation hint when the grammar should be
+    compiled directly (EBNF / regex / choice) rather than via structural tag.
+    """
+    import json as _json
+    from .api.openai_models import StructuredOutputOptions
+
+    if structured_outputs is not None:
+        if isinstance(structured_outputs, dict):
+            structured_outputs = StructuredOutputOptions(**structured_outputs)
+
+        if structured_outputs.json_schema is not None:
+            schema = structured_outputs.json_schema
+            if isinstance(schema, str):
+                schema = _json.loads(schema)
+            return {"type": "json_schema", "json_schema": schema}
+        if structured_outputs.grammar is not None:
+            return {"type": "grammar", "grammar": structured_outputs.grammar}
+        if structured_outputs.regex is not None:
+            return {"type": "regex", "pattern": structured_outputs.regex}
+        if structured_outputs.choice is not None:
+            ebnf = "root ::= " + " | ".join(
+                _json.dumps(c) for c in structured_outputs.choice
+            )
+            return {"type": "grammar", "grammar": ebnf}
+
+    if response_format is not None:
+        rf = response_format
+        rf_type = (
+            rf.get("type") if isinstance(rf, dict)
+            else getattr(rf, "type", None)
+        )
+        if rf_type == "json_schema":
+            js = (
+                rf.get("json_schema") if isinstance(rf, dict)
+                else getattr(rf, "json_schema", None)
+            )
+            if js is not None:
+                schema = (
+                    js.get("schema") if isinstance(js, dict)
+                    else getattr(js, "schema_", None)
+                )
+                if schema is not None:
+                    return {"type": "json_schema", "json_schema": schema}
+        elif rf_type == "json_object":
+            return {"type": "json_schema", "json_schema": {}}
+
+    return None
+
+
+def _patch_output_format(tag_dict: dict, user_grammar: dict) -> bool:
+    """Replace the output ``any_text`` slot in a builtin structural tag.
+
+    Walks the structural tag dict produced by
+    ``xgrammar.get_builtin_structural_tag`` and swaps the ``any_text``
+    element that represents the model's output with ``user_grammar``.
+
+    Returns ``True`` if a replacement was made.
+    """
+    fmt = tag_dict.get("format", tag_dict)
+
+    if fmt.get("type") == "any_text":
+        tag_dict["format"] = user_grammar
+        return True
+
+    if fmt.get("type") == "sequence":
+        for i in range(len(fmt["elements"]) - 1, -1, -1):
+            if fmt["elements"][i].get("type") == "any_text":
+                fmt["elements"][i] = user_grammar
+                return True
+
+    if fmt.get("type") == "tags_with_separator":
+        for tag in reversed(fmt["tags"]):
+            if tag.get("type") == "tag" and "final" in tag.get("begin", ""):
+                tag["content"] = user_grammar
+                return True
+        if fmt["tags"]:
+            fmt["tags"][-1]["content"] = user_grammar
+            return True
+
+    return False
+
+
+def _compile_with_structural_tag(compiler, fmt: dict, reasoning_parser: str,
+                                  chat_template_kwargs: dict | None):
+    """Compile a grammar wrapped in an xgrammar builtin structural tag.
+
+    Uses ``xgrammar.get_builtin_structural_tag`` to obtain the model's
+    protocol structure (thinking tags, channel markers, etc.) and patches
+    the user's grammar into the output slot.
+    """
+    import xgrammar as xgr
+
+    reasoning = not (
+        chat_template_kwargs
+        and chat_template_kwargs.get("enable_thinking") is False
+    )
+    tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
+    tag_dict = tag.model_dump()
+    if not _patch_output_format(tag_dict, fmt):
+        logger.warning(
+            "Could not patch output format for reasoning_parser=%s, "
+            "compiling structural tag as-is",
+            reasoning_parser,
+        )
+    return compiler.compile_structural_tag(tag_dict)
+
+
+def _compile_bare_grammar(compiler, fmt: dict):
+    """Compile a grammar without any structural tag wrapping."""
+    if fmt["type"] == "json_schema":
+        import json as _json
+        schema = fmt["json_schema"]
+        if not schema:
+            return compiler.compile_builtin_json_grammar()
+        schema_str = _json.dumps(schema) if isinstance(schema, dict) else schema
+        return compiler.compile_json_schema(schema_str)
+    elif fmt["type"] == "grammar":
+        return compiler.compile_grammar(fmt["grammar"])
+    elif fmt["type"] == "regex":
+        return compiler.compile_regex(fmt["pattern"])
+    return None
+
+
+def _compile_grammar_for_request(
+    engine: BaseEngine,
+    structured_outputs=None,
+    response_format=None,
+    chat_template_kwargs=None,
+    reasoning_parser=None,
+):
+    """Compile a grammar from structured_outputs or response_format.
+
+    When ``reasoning_parser`` is set (e.g. ``"qwen"``, ``"harmony"``),
+    the user's grammar is wrapped in an xgrammar builtin structural tag
+    so that protocol tokens (thinking tags, channel markers) are handled
+    automatically.  When not set, the grammar is compiled bare.
+
+    Returns a compiled grammar object or ``None``.  Raises
+    :class:`HTTPException` on compilation errors or when xgrammar is
+    required but not installed.
+    """
+    compiler = getattr(engine, 'grammar_compiler', None)
+
+    fmt = _build_format_element(structured_outputs, response_format)
+    if fmt is None:
+        return None
+
+    if compiler is None:
+        if structured_outputs is not None:
+            from omlx.utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                detail = (
+                    "Structured output is not available in the DMG version. "
+                    "xgrammar requires torch which significantly increases app size. "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                detail = (
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                detail = (
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
+            raise HTTPException(status_code=400, detail=detail)
+        return None
+
+    try:
+        if reasoning_parser:
+            return _compile_with_structural_tag(
+                compiler, fmt, reasoning_parser, chat_template_kwargs,
+            )
+        return _compile_bare_grammar(compiler, fmt)
+    except Exception as e:
+        if structured_outputs is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Grammar compilation error: {e}",
+            )
+        logger.warning("Grammar compilation from response_format failed, "
+                       "falling back to prompt injection: %s", e)
+    return None
+
+
 # =============================================================================
 # Streaming Helpers
 # =============================================================================
@@ -2042,12 +2384,14 @@ async def stream_completion(
     first_token_time = None
     last_output = None
 
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
         req_max_tokens=request.max_tokens,
+        req_xtc_probability=getattr(request, 'xtc_probability', None),
+        req_xtc_threshold=getattr(request, 'xtc_threshold', None),
     )
     try:
         async for output in engine.stream_generate(
@@ -2060,7 +2404,10 @@ async def stream_completion(
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
+            xtc_probability=xtc_probability,
+            xtc_threshold=xtc_threshold,
             stop=request.stop,
+            seed=request.seed,
         ):
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
@@ -2220,15 +2567,10 @@ async def stream_chat_completion(
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
-        error_chunk = ChatCompletionChunk(
-            id=response_id,
-            model=request.model,
-            choices=[ChatCompletionChunkChoice(
-                delta=ChatCompletionChunkDelta(),
-                finish_reason="stop",
-            )],
-        )
-        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+        error_data = {
+            "error": {"message": str(e), "type": "server_error"}
+        }
+        yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
 
@@ -2784,8 +3126,14 @@ async def create_anthropic_message(
             preserve_images=is_vlm,
         )
 
+    # Apply model-specific message extraction (e.g. Gemma 4 converts
+    # role=tool messages into tool_responses on assistant turns).
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
+
     # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_max_tokens=request.max_tokens,
     )
@@ -2799,6 +3147,8 @@ async def create_anthropic_message(
         "repetition_penalty": repetition_penalty,
         "presence_penalty": presence_penalty,
         "frequency_penalty": frequency_penalty,
+        "xtc_probability": xtc_probability,
+        "xtc_threshold": xtc_threshold,
     }
 
     # Add thinking budget if applicable
@@ -2863,79 +3213,75 @@ async def create_anthropic_message(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    # Non-streaming response
-    start_time = time.perf_counter()
+    # Non-streaming response with keepalive during prefill
+    async def _build_anthropic_message():
+        start_time = time.perf_counter()
 
-    output = await _run_with_disconnect_guard(
-        http_request,
-        engine.chat(messages=messages, **chat_kwargs),
-    )
-    if output is None:
-        return  # Client disconnected
+        output = await engine.chat(messages=messages, **chat_kwargs)
 
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Anthropic message: {output.completion_tokens} tokens in {elapsed:.2f}s "
-        f"({tokens_per_sec:.1f} tok/s)"
-    )
-
-    # Record metrics
-    get_server_metrics().record_request_complete(
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-        cached_tokens=output.cached_tokens,
-        generation_duration=elapsed,
-        model_id=request.model,
-    )
-
-    # Separate thinking from content
-    raw_text = clean_special_tokens(output.text) if output.text else ""
-    thinking_content, regular_content = extract_thinking(raw_text)
-    cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
-
-    # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
-    # For other models, parse from text output
-    if engine.model_type == "gpt_oss" and output.tool_calls:
-        # Harmony model with tool calls - convert format
-        from .api.openai_models import ToolCall, FunctionCall
-        tool_calls = [
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                ),
-            )
-            for tc in output.tool_calls
-        ]
-        cleaned_text = regular_content
-    else:
-        # Parse tool calls from regular content, falling back to thinking
-        # content for small models that emit tool calls inside <think> blocks
-        extraction = extract_tool_calls_with_thinking(
-            thinking_content,
-            regular_content,
-            tokenizer=engine.tokenizer,
-            tools=internal_tools,
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"Anthropic message: {output.completion_tokens} tokens in {elapsed:.2f}s "
+            f"({tokens_per_sec:.1f} tok/s)"
         )
-        cleaned_text = extraction.cleaned_text
-        tool_calls = extraction.tool_calls
-        cleaned_thinking = extraction.cleaned_thinking
 
-    # Convert to Anthropic response format
-    response = convert_internal_to_anthropic_response(
-        text=cleaned_text.strip() if cleaned_text else regular_content,
-        model=request.model,
-        prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
-        completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),
-        finish_reason=output.finish_reason,
-        tool_calls=tool_calls,
-        thinking=cleaned_thinking if cleaned_thinking else None,
+        get_server_metrics().record_request_complete(
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            cached_tokens=output.cached_tokens,
+            generation_duration=elapsed,
+            model_id=request.model,
+        )
+
+        # Separate thinking from content
+        raw_text = clean_special_tokens(output.text) if output.text else ""
+        thinking_content, regular_content = extract_thinking(raw_text)
+        cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
+
+        # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
+        # For other models, parse from text output
+        if engine.model_type == "gpt_oss" and output.tool_calls:
+            from .api.openai_models import ToolCall, FunctionCall
+            tool_calls = [
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=tc["name"],
+                        arguments=tc["arguments"],
+                    ),
+                )
+                for tc in output.tool_calls
+            ]
+            cleaned_text = regular_content
+        else:
+            extraction = extract_tool_calls_with_thinking(
+                thinking_content,
+                regular_content,
+                tokenizer=engine.tokenizer,
+                tools=internal_tools,
+            )
+            cleaned_text = extraction.cleaned_text
+            tool_calls = extraction.tool_calls
+            cleaned_thinking = extraction.cleaned_thinking
+
+        response = convert_internal_to_anthropic_response(
+            text=cleaned_text.strip() if cleaned_text else regular_content,
+            model=request.model,
+            prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
+            completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),
+            finish_reason=output.finish_reason,
+            tool_calls=tool_calls,
+            thinking=cleaned_thinking if cleaned_thinking else None,
+        )
+
+        return response.model_dump_json()
+
+    return StreamingResponse(
+        _with_json_keepalive(http_request, _build_anthropic_message()),
+        media_type="application/json",
     )
-
-    return response
 
 
 @app.post("/v1/messages/count_tokens")
@@ -3098,9 +3444,11 @@ async def create_response(
     max_tool_result_tokens = None
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
+    reasoning_parser = None
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(resolved_model)
         max_tool_result_tokens = ms.max_tool_result_tokens
+        reasoning_parser = ms.reasoning_parser
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
@@ -3112,6 +3460,7 @@ async def create_response(
 
     # Handle text.format (structured output)
     response_format = None
+    compiled_grammar = None
     if request.text and request.text.format:
         fmt = request.text.format
         if fmt.type == "json_object":
@@ -3128,10 +3477,19 @@ async def create_response(
         if response_format:
             from .api.openai_models import ResponseFormat
 
+            await engine.start()
             rf = ResponseFormat(**response_format)
-            json_instruction = build_json_system_prompt(rf)
-            if json_instruction:
-                messages = _inject_json_instruction(messages, json_instruction)
+            compiled_grammar = _compile_grammar_for_request(
+                engine, response_format=rf,
+                chat_template_kwargs=merged_ct_kwargs or None,
+                reasoning_parser=reasoning_parser,
+            )
+            if compiled_grammar is None:
+                json_instruction = build_json_system_prompt(rf)
+                if json_instruction:
+                    messages = _inject_json_instruction(messages, json_instruction)
+        else:
+            compiled_grammar = None
 
     # Merge MCP tools
     effective_tools = openai_tools
@@ -3165,7 +3523,7 @@ async def create_response(
     validate_context_window(num_prompt_tokens, request.model)
 
     # Build sampling kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = (
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = (
         get_sampling_params(request.temperature, request.top_p, request.model, req_max_tokens=request.max_output_tokens)
     )
     chat_kwargs = {
@@ -3177,12 +3535,29 @@ async def create_response(
         "repetition_penalty": repetition_penalty,
         "presence_penalty": presence_penalty,
         "frequency_penalty": frequency_penalty,
+        "xtc_probability": xtc_probability,
+        "xtc_threshold": xtc_threshold,
     }
+
+    # Add seed for reproducible generation (best-effort)
+    if request.seed is not None:
+        chat_kwargs["seed"] = request.seed
 
     # Add thinking budget if applicable
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
+
+    # Add compiled grammar for logit-level structured output.
+    if compiled_grammar is not None:
+        chat_kwargs["compiled_grammar"] = compiled_grammar
+        if reasoning_parser and "thinking_budget" not in chat_kwargs:
+            default_budget = min(max_tokens // 2, 4096)
+            chat_kwargs["thinking_budget"] = default_budget
+            logger.debug(
+                "Auto-set thinking_budget=%d for grammar-constrained request",
+                default_budget,
+            )
 
     if tools_for_template:
         chat_kwargs["tools"] = tools_for_template
@@ -3207,100 +3582,98 @@ async def create_response(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    # Non-streaming
-    start_time = time.perf_counter()
-    output = await _run_with_disconnect_guard(
-        http_request,
-        engine.chat(messages=messages, **chat_kwargs),
-    )
-    if output is None:
-        return
+    # Non-streaming with keepalive during prefill
+    async def _build_responses_api():
+        start_time = time.perf_counter()
+        output = await engine.chat(messages=messages, **chat_kwargs)
 
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Responses API: {output.completion_tokens} tokens in {elapsed:.2f}s "
-        f"({tokens_per_sec:.1f} tok/s)"
-    )
-
-    get_server_metrics().record_request_complete(
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-        cached_tokens=output.cached_tokens,
-        generation_duration=elapsed,
-        model_id=request.model,
-    )
-
-    # Process output text
-    raw_text = clean_special_tokens(output.text) if output.text else ""
-    thinking_content, regular_content = extract_thinking(raw_text)
-
-    # Parse tool calls
-    if engine.model_type == "gpt_oss" and output.tool_calls:
-        tool_calls = output.tool_calls
-        cleaned_text = regular_content
-    else:
-        # Falls back to thinking content for small models that emit
-        # tool calls inside <think> blocks
-        extraction = extract_tool_calls_with_thinking(
-            thinking_content,
-            regular_content,
-            tokenizer=engine.tokenizer,
-            tools=tools_for_template,
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"Responses API: {output.completion_tokens} tokens in {elapsed:.2f}s "
+            f"({tokens_per_sec:.1f} tok/s)"
         )
-        cleaned_text = extraction.cleaned_text
-        tool_calls = extraction.tool_calls
 
-    # Build output items
-    output_items: list[OutputItem] = []
-    output_items.append(
-        build_message_output_item(cleaned_text.strip() if cleaned_text else "")
-    )
+        get_server_metrics().record_request_complete(
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            cached_tokens=output.cached_tokens,
+            generation_duration=elapsed,
+            model_id=request.model,
+        )
 
-    if tool_calls:
-        for tc in tool_calls:
-            if hasattr(tc, "function"):
-                # ToolCall Pydantic model
-                call_id = tc.id
-                name = tc.function.name
-                arguments = tc.function.arguments
-            elif isinstance(tc, dict):
-                call_id = tc.get("call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}"))
-                name = tc.get("name", "")
-                arguments = tc.get("arguments", "{}")
-            else:
-                continue
-            output_items.append(
-                build_function_call_output_item(
-                    name=name,
-                    arguments=arguments,
-                    call_id=call_id,
+        # Process output text
+        raw_text = clean_special_tokens(output.text) if output.text else ""
+        thinking_content, regular_content = extract_thinking(raw_text)
+
+        # Parse tool calls
+        if engine.model_type == "gpt_oss" and output.tool_calls:
+            tool_calls = output.tool_calls
+            cleaned_text = regular_content
+        else:
+            extraction = extract_tool_calls_with_thinking(
+                thinking_content,
+                regular_content,
+                tokenizer=engine.tokenizer,
+                tools=tools_for_template,
+            )
+            cleaned_text = extraction.cleaned_text
+            tool_calls = extraction.tool_calls
+
+        # Build output items
+        output_items: list[OutputItem] = []
+        output_items.append(
+            build_message_output_item(cleaned_text.strip() if cleaned_text else "")
+        )
+
+        if tool_calls:
+            for tc in tool_calls:
+                if hasattr(tc, "function"):
+                    call_id = tc.id
+                    name = tc.function.name
+                    arguments = tc.function.arguments
+                elif isinstance(tc, dict):
+                    call_id = tc.get("call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}"))
+                    name = tc.get("name", "")
+                    arguments = tc.get("arguments", "{}")
+                else:
+                    continue
+                output_items.append(
+                    build_function_call_output_item(
+                        name=name,
+                        arguments=arguments,
+                        call_id=call_id,
+                    )
                 )
+
+        usage = build_response_usage(output.prompt_tokens, output.completion_tokens)
+
+        response_obj = ResponseObject(
+            model=request.model,
+            status="completed",
+            output=output_items,
+            usage=usage,
+            tools=request.tools or [],
+            tool_choice=request.tool_choice or "auto",
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=request.max_output_tokens,
+            previous_response_id=request.previous_response_id,
+        )
+
+        # Store response
+        if _should_store_response(request.store):
+            _store_response_state(
+                response_obj.model_dump(exclude_none=True),
+                input_messages=current_input_messages,
             )
 
-    usage = build_response_usage(output.prompt_tokens, output.completion_tokens)
+        return response_obj.model_dump_json()
 
-    response_obj = ResponseObject(
-        model=request.model,
-        status="completed",
-        output=output_items,
-        usage=usage,
-        tools=request.tools or [],
-        tool_choice=request.tool_choice or "auto",
-        temperature=temperature,
-        top_p=top_p,
-        max_output_tokens=request.max_output_tokens,
-        previous_response_id=request.previous_response_id,
+    return StreamingResponse(
+        _with_json_keepalive(http_request, _build_responses_api()),
+        media_type="application/json",
     )
-
-    # Store response
-    if _should_store_response(request.store):
-        _store_response_state(
-            response_obj.model_dump(exclude_none=True),
-            input_messages=current_input_messages,
-        )
-
-    return response_obj
 
 
 async def stream_responses_api(
@@ -3710,8 +4083,11 @@ async def init_mcp(config_path: str):
         )
         return
     except Exception as e:
-        logger.error(f"Failed to initialize MCP: {e}")
-        raise
+        logger.error(
+            f"Failed to initialize MCP: {e}. "
+            "MCP features disabled. Fix your MCP config and restart."
+        )
+        return
 
 
 # =============================================================================

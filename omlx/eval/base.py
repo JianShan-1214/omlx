@@ -11,6 +11,10 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Token budget for thinking/reasoning models (industry reference: OpenCompass 8K~32K)
+THINKING_MIN_TOKENS = 8192
+THINKING_MAX_TOKENS = 32768
+
 
 @dataclass
 class QuestionResult:
@@ -36,6 +40,7 @@ class BenchmarkResult:
     time_seconds: float
     question_results: list[QuestionResult] = field(default_factory=list)
     category_scores: Optional[dict[str, float]] = None
+    thinking_used: bool = False
 
 
 class BaseBenchmark(ABC):
@@ -88,6 +93,77 @@ class BaseBenchmark(ABC):
         return item.get("question", item.get("description", item.get("context", "")))
 
     @staticmethod
+    def _extract_mc_answer(response: str, valid_letters: list[str]) -> str:
+        """Extract multiple choice answer from response.
+
+        Strategy:
+        1. Look for explicit "answer is X" / "answer: X" patterns (last match)
+        2. Fall back to last valid letter in response
+        3. Case-insensitive
+        """
+        response_upper = response.strip().upper()
+        pattern_letters = "".join(valid_letters)
+
+        # 1. Look for "answer is X", "answer: X", "answer X" patterns — use LAST match
+        answer_patterns = re.findall(
+            r"(?:answer\s*(?:is|:)\s*)([" + pattern_letters + r"])\b",
+            response_upper,
+        )
+        if answer_patterns:
+            return answer_patterns[-1]
+
+        # 2. Fall back to last valid letter with word boundary
+        all_matches = re.findall(
+            r"\b([" + pattern_letters + r"])\b",
+            response_upper,
+        )
+        if all_matches:
+            return all_matches[-1]
+
+        # 3. Check first character
+        if response.strip() and response.strip()[0].upper() in valid_letters:
+            return response.strip()[0].upper()
+
+        return ""
+
+    @staticmethod
+    def _extract_last_code_block(response: str) -> str:
+        """Extract the LAST code block from model response.
+
+        Uses last match to avoid picking up drafts/examples.
+        Falls back to line-by-line detection if no code blocks found.
+        """
+        response = response.strip()
+
+        # Find ALL python code blocks, use LAST
+        blocks = re.findall(r"```python\s*\n(.*?)```", response, re.DOTALL)
+        if blocks:
+            return blocks[-1].strip()
+
+        # Generic code blocks
+        blocks = re.findall(r"```\s*\n(.*?)```", response, re.DOTALL)
+        if blocks:
+            return blocks[-1].strip()
+
+        # Line-by-line fallback
+        lines = response.split("\n")
+        code_lines = []
+        in_code = False
+        for line in lines:
+            if not in_code and (
+                line.startswith("def ")
+                or line.startswith("class ")
+                or line.startswith("import ")
+                or line.startswith("from ")
+                or line.startswith("#")
+            ):
+                in_code = True
+            if in_code:
+                code_lines.append(line)
+
+        return "\n".join(code_lines) if code_lines else response
+
+    @staticmethod
     def _strip_think_tags(text: str) -> str:
         """Remove <think>...</think> blocks from model output."""
         return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -95,22 +171,45 @@ class BaseBenchmark(ABC):
     async def _eval_single(
         self, engine: Any, item: dict, index: int,
         sampling_kwargs: Optional[dict] = None,
-    ) -> tuple[int, dict, str, str]:
-        """Evaluate a single item. Returns (index, item, response_text, prompt_text)."""
+        enable_thinking: bool = False,
+    ) -> tuple[int, dict, str, str, str]:
+        """Evaluate a single item.
+
+        Returns (index, item, response_text, prompt_text, raw_text).
+        raw_text is the unstripped output for auto-detection of thinking tags.
+        """
         messages = self.format_prompt(item)
-        # Extract the full prompt text for logging
         prompt_text = "\n".join(m.get("content", "") for m in messages)
         kwargs = dict(sampling_kwargs or {})
         # Force benchmark-controlled params (override model settings)
-        kwargs["max_tokens"] = self.get_max_tokens()
+        max_tokens = self.get_max_tokens()
+        # Harmony models (gpt_oss) use analysis + final channels;
+        # analysis can consume the entire budget before final is emitted
+        if getattr(engine, "model_type", None) == "gpt_oss":
+            max_tokens = max(max_tokens * 4, 8192)
+        elif enable_thinking:
+            max_tokens = min(
+                max(max_tokens, THINKING_MIN_TOKENS), THINKING_MAX_TOKENS
+            )
+        kwargs["max_tokens"] = max_tokens
         kwargs["temperature"] = 0.0
+        kwargs["presence_penalty"] = 0.0
+        kwargs["repetition_penalty"] = 1.0
+        # Merge enable_thinking into any existing chat_template_kwargs
+        ct_kwargs = kwargs.pop("chat_template_kwargs", {}) or {}
+        ct_kwargs["enable_thinking"] = enable_thinking
+        kwargs["chat_template_kwargs"] = ct_kwargs
         try:
-            output = await engine.chat(messages=messages, **kwargs)
-            text = self._strip_think_tags(output.text)
-            return index, item, text, prompt_text
+            output = await engine.chat(
+                messages=messages,
+                **kwargs,
+            )
+            raw_text = output.text
+            text = self._strip_think_tags(raw_text)
+            return index, item, text, prompt_text, raw_text
         except Exception as e:
             logger.warning(f"Engine error on question {index}: {e}")
-            return index, item, "", prompt_text
+            return index, item, "", prompt_text, ""
 
     async def run(
         self,
@@ -119,6 +218,7 @@ class BaseBenchmark(ABC):
         on_progress: Optional[Callable[[int, int], Any]] = None,
         batch_size: int = 1,
         sampling_kwargs: Optional[dict] = None,
+        enable_thinking: bool = False,
     ) -> BenchmarkResult:
         """Run the benchmark on all items.
 
@@ -127,6 +227,9 @@ class BaseBenchmark(ABC):
             items: Dataset items to evaluate.
             on_progress: Callback(current, total) for progress reporting.
             batch_size: Number of concurrent requests (1 = sequential).
+            enable_thinking: Enable thinking mode for reasoning models.
+                When False, auto-detects if the model outputs <think> tags
+                and re-runs the first batch with thinking enabled.
 
         Returns:
             BenchmarkResult with accuracy and per-question details.
@@ -138,6 +241,9 @@ class BaseBenchmark(ABC):
         start_time = time.time()
         completed = 0
 
+        thinking_used = enable_thinking
+        auto_switched = False
+
         # Process in batches
         for batch_start in range(0, len(items), batch_size):
             batch_end = min(batch_start + batch_size, len(items))
@@ -146,14 +252,38 @@ class BaseBenchmark(ABC):
 
             # Launch concurrent requests
             tasks = [
-                self._eval_single(engine, item, batch_start + j, sampling_kwargs)
+                self._eval_single(
+                    engine, item, batch_start + j, sampling_kwargs, thinking_used
+                )
                 for j, item in enumerate(batch)
             ]
             batch_results = await asyncio.gather(*tasks)
+
+            # Auto-detection: check first batch for <think> tags
+            if not thinking_used and not auto_switched and batch_start == 0:
+                auto_switched = True
+                has_think_tags = any(
+                    "<think>" in raw for _, _, _, _, raw in batch_results
+                )
+                if has_think_tags:
+                    logger.warning(
+                        f"{self.name}: model outputs <think> tags with "
+                        "enable_thinking=False, auto-switching to thinking mode"
+                    )
+                    thinking_used = True
+                    # Re-run first batch with increased token budget
+                    tasks = [
+                        self._eval_single(
+                            engine, item, batch_start + j, sampling_kwargs, True
+                        )
+                        for j, item in enumerate(batch)
+                    ]
+                    batch_results = await asyncio.gather(*tasks)
+
             batch_elapsed = time.time() - batch_start_time
 
             # Process results in order
-            for idx, item, response_text, prompt_text in sorted(batch_results, key=lambda x: x[0]):
+            for idx, item, response_text, prompt_text, _raw in sorted(batch_results, key=lambda x: x[0]):
                 predicted = self.extract_answer(response_text, item)
                 is_correct = self.check_answer(predicted, item)
 
@@ -206,4 +336,5 @@ class BaseBenchmark(ABC):
             time_seconds=total_time,
             question_results=results,
             category_scores=cat_scores,
+            thinking_used=thinking_used,
         )

@@ -18,6 +18,7 @@ Note: BatchGenerator is mocked; step() is too complex for unit tests.
 from collections import deque
 from unittest.mock import MagicMock, patch, PropertyMock
 
+import mlx.core as mx
 import pytest
 
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -434,10 +435,10 @@ class TestSchedulerAbortRequest:
 
         scheduler.batch_generator.remove.assert_called_once_with([uid])
 
-    def test_abort_running_request_skips_remove_when_uid_not_in_active_batch(
+    def test_abort_running_request_always_calls_remove(
         self, mock_model, mock_tokenizer
     ):
-        """Abort must not call remove() when UID is already absent."""
+        """Abort always calls remove() — BatchGenerator handles unknown UIDs."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         request = Request(
@@ -456,12 +457,11 @@ class TestSchedulerAbortRequest:
         scheduler.uid_to_request_id[uid] = "req-run-missing"
 
         scheduler.batch_generator = MagicMock()
-        scheduler.batch_generator.active_batch = MagicMock(uids=[999])
 
         scheduler.abort_request("req-run-missing")
         scheduler._process_pending_aborts()
 
-        scheduler.batch_generator.remove.assert_not_called()
+        scheduler.batch_generator.remove.assert_called_once_with([uid])
 
     def test_abort_cleans_all_scheduler_state(self, mock_model, mock_tokenizer):
         """Abort must clean running, uid mappings, and requests dict.
@@ -537,11 +537,12 @@ class TestPrefillAbortInterrupt:
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.batch_generator = MagicMock()
 
-        # Make batch_generator.next() raise _PrefillAbortedError
-        scheduler.batch_generator.next.side_effect = _PrefillAbortedError(
+        # Make next_generated() raise _PrefillAbortedError
+        # (simulates abort during external prefill in _schedule_waiting)
+        scheduler.batch_generator.next_generated.side_effect = _PrefillAbortedError(
             [0], 1024
         )
-        # Need running requests for next() to be called
+        # Need running requests for next_generated() to be called
         request = Request(
             request_id="req-prefill",
             prompt="Hello",
@@ -703,6 +704,41 @@ class TestSchedulerStopTokens:
         assert mock_tokenizer.eos_token_id in stop_tokens
 
 
+class TestSchedulerXtcSpecialTokens:
+    """Tests for _get_xtc_special_tokens()."""
+
+    def test_includes_newline_and_eos(self, mock_model, mock_tokenizer):
+        """Test that XTC special tokens include newline encoding and EOS."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        tokens = scheduler._get_xtc_special_tokens()
+
+        # Should include tokens from encoding "\n"
+        newline_tokens = mock_tokenizer.encode("\n")
+        for t in newline_tokens:
+            assert t in tokens
+
+        # Should include eos_token_id (MockTokenizer has eos_token_id=2)
+        assert mock_tokenizer.eos_token_id in tokens
+
+    def test_includes_eos_token_ids_plural(self, mock_model, mock_tokenizer):
+        """Test that eos_token_ids (plural) is used when available."""
+        mock_tokenizer.eos_token_ids = [2, 100, 200]
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        tokens = scheduler._get_xtc_special_tokens()
+
+        for eos_id in [2, 100, 200]:
+            assert eos_id in tokens
+
+    def test_falls_back_to_singular_eos(self, mock_model, mock_tokenizer):
+        """Test fallback to eos_token_id when eos_token_ids is absent."""
+        # MockTokenizer has eos_token_id=2 but no eos_token_ids
+        assert not hasattr(mock_tokenizer, 'eos_token_ids')
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        tokens = scheduler._get_xtc_special_tokens()
+
+        assert 2 in tokens
+
+
 class TestSchedulerFormatBytes:
     """Tests for Scheduler._format_bytes()."""
 
@@ -774,18 +810,15 @@ class TestSchedulerBoundarySnapshots:
         scheduler.block_aware_cache = MagicMock()
         scheduler._boundary_snapshot_required = True
 
-        mock_batch = MagicMock()
-        mock_batch.uids = [123]
-        # Create a non-sliceable batch cache layer (e.g. ArraysCache)
-        # so the snapshot capture extracts it instead of replacing with None.
+        # New API: _extract_boundary_snapshot uses batch_generator.extract_cache()
+        # which returns {uid: (cache_list, tokens_list)}.
         mock_layer_cache = MagicMock()
         type(mock_layer_cache).__name__ = "BatchArraysCache"
-        extracted_cache = MagicMock()
-        mock_layer_cache.extract.return_value = extracted_cache
-        mock_batch.cache = [mock_layer_cache]
 
         scheduler.batch_generator = MagicMock()
-        scheduler.batch_generator.active_batch = mock_batch
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([mock_layer_cache], [10, 11, 12, 13])
+        }
 
         request = Request(
             request_id="req-boundary",
@@ -800,8 +833,8 @@ class TestSchedulerBoundarySnapshots:
 
         assert 4 in scheduler._boundary_cache_snapshots["req-boundary"]
         snapshot = scheduler._boundary_cache_snapshots["req-boundary"][4]
-        assert snapshot == [extracted_cache]
-        mock_layer_cache.extract.assert_called_once_with(0)
+        # Non-sliceable cache layer is kept as-is in the snapshot
+        assert snapshot == [mock_layer_cache]
 
     def test_cleanup_finished_skips_output_tokens_for_reasoning_model(
         self, mock_model, mock_tokenizer
@@ -966,6 +999,11 @@ class TestSchedulerBoundarySnapshots:
             scheduler._cleanup_finished({"req-cleanup-sync"})
             mock_mx.synchronize.assert_called()
             mock_mx.stream.assert_called()
+            # Metal buffer cache clear is now DEFERRED by _DEFERRED_CLEAR_DELAY
+            # generation steps to avoid IOKit completeMemory() race (#435).
+            # It should NOT be called immediately in _cleanup_finished.
+            mock_mx.clear_cache.assert_not_called()
+            assert scheduler._deferred_clear_steps == 0
 
     def test_prefill_boundary_snapshot_records_rotating_cache(
         self, mock_model, mock_tokenizer
@@ -1079,10 +1117,12 @@ class TestSchedulerRotatingBlockAlignment:
         with pytest.raises(ValueError):
             scheduler._align_block_size_with_rotating_window()
 
-    def test_cleanup_finished_skips_remove_when_uid_not_in_active_batch(
+    def test_cleanup_finished_always_calls_remove_for_mapped_uid(
         self, mock_model, mock_tokenizer
     ):
-        """_cleanup_finished should not call remove() for already-filtered UIDs."""
+        """_cleanup_finished should always call remove() for UIDs with mapping,
+        regardless of whether the UID is in the active batch.
+        The new _remove_uid_from_active_batch unconditionally calls remove()."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         request = Request(
@@ -1105,7 +1145,7 @@ class TestSchedulerRotatingBlockAlignment:
 
         scheduler._cleanup_finished({"req-skip-remove"})
 
-        scheduler.batch_generator.remove.assert_not_called()
+        scheduler.batch_generator.remove.assert_called_once_with([uid])
 
     def test_cleanup_finished_removes_uid_from_active_batch(
         self, mock_model, mock_tokenizer
@@ -1134,6 +1174,48 @@ class TestSchedulerRotatingBlockAlignment:
         scheduler._cleanup_finished({"req-remove-active"})
 
         scheduler.batch_generator.remove.assert_called_once_with([uid])
+
+    def test_cleanup_finished_defers_metal_buffer_cache_clear(
+        self, mock_model, mock_tokenizer
+    ):
+        """_cleanup_finished must defer Metal buffer cache clear (#435).
+
+        Immediate mx.clear_cache() after request completion races with
+        IOKit's asynchronous completeMemory() callbacks. Instead,
+        _cleanup_finished sets _deferred_clear_steps so the clear happens
+        after _DEFERRED_CLEAR_DELAY generation steps.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-clear-cache",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [3]
+
+        scheduler.running["req-clear-cache"] = request
+        scheduler.requests["req-clear-cache"] = request
+
+        with patch("omlx.scheduler.mx") as mock_mx:
+            scheduler._cleanup_finished({"req-clear-cache"})
+            # Should NOT clear immediately — deferred to avoid IOKit race
+            mock_mx.clear_cache.assert_not_called()
+            # Counter should be set for deferred clearing
+            assert scheduler._deferred_clear_steps == 0
+
+    def test_cleanup_finished_skips_clear_cache_when_no_finished(
+        self, mock_model, mock_tokenizer
+    ):
+        """_cleanup_finished must not schedule deferred clear when no requests finished."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        with patch("omlx.scheduler.mx") as mock_mx:
+            scheduler._cleanup_finished(set())
+            mock_mx.clear_cache.assert_not_called()
+            assert scheduler._deferred_clear_steps is None
 
 
 class TestExtractCacheStatesCacheList:
@@ -1383,3 +1465,280 @@ class TestCacheCorruptionRecovery:
         assert scheduler._current_sampler_params is None
         # Cache should NOT be cleared (not a corruption error)
         scheduler.block_aware_cache.clear.assert_not_called()
+
+
+class TestDetectNeedsThinkPrefix:
+    """Tests for _detect_needs_think_prefix() method.
+
+    Verifies that <think></think> (disabled thinking) patterns are correctly
+    distinguished from <think>\\n (enabled thinking) patterns.
+    """
+
+    def _make_scheduler(self, mock_model, think_start_id, think_end_id=None):
+        """Create scheduler with think token IDs on the tokenizer."""
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+        tokenizer.think_start_id = think_start_id
+        if think_end_id is not None:
+            tokenizer.think_end_id = think_end_id
+        return Scheduler(model=mock_model, tokenizer=tokenizer)
+
+    def _make_request(self, prompt_token_ids):
+        """Create a request with given prompt token IDs."""
+        return Request(
+            request_id="test-think",
+            prompt="test",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=list(prompt_token_ids),
+            num_prompt_tokens=len(prompt_token_ids),
+        )
+
+    def test_enabled_thinking_with_newline(self, mock_model):
+        """<think> + \\n at end -> True (enabled thinking, e.g. DeepSeek)."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 3, 100, 198])  # 198 = \n
+        assert scheduler._detect_needs_think_prefix(request) is True
+
+    def test_enabled_thinking_last_token(self, mock_model):
+        """<think> as last token -> True."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 3, 100])
+        assert scheduler._detect_needs_think_prefix(request) is True
+
+    def test_disabled_thinking_adjacent(self, mock_model):
+        """<think></think> adjacent -> False (disabled, e.g. Nemotron)."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 3, 100, 101])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_disabled_thinking_with_prefix(self, mock_model):
+        """X <think></think> -> False (disabled with preceding token)."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 50, 100, 101])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_no_think_token_in_tail(self, mock_model):
+        """No <think> in last 3 tokens -> False."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([1, 2, 3, 4, 5])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_no_think_start_id_on_tokenizer(self, mock_model):
+        """Tokenizer without think_start_id -> False."""
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        request = self._make_request([1, 2, 3])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_empty_prompt(self, mock_model):
+        """Empty prompt -> False."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
+        request = self._make_request([])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_no_think_end_id_still_sets_true(self, mock_model):
+        """<think> found but no think_end_id resolvable -> True (safe fallback)."""
+        scheduler = self._make_scheduler(mock_model, think_start_id=100)
+        request = self._make_request([1, 2, 100, 101])
+        assert scheduler._detect_needs_think_prefix(request) is True
+
+    def test_think_start_id_raises_type_error(self, mock_model):
+        """Tokenizer whose think_start_id raises TypeError -> False.
+
+        Models like context-1 (harmony parser) have _think_start_tokens=None
+        in their mlx-lm tokenizer, causing think_start_id to raise TypeError.
+        """
+        from unittest.mock import PropertyMock
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+        type(tokenizer).think_start_id = PropertyMock(
+            side_effect=TypeError("object of type 'NoneType' has no len()")
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        request = self._make_request([1, 2, 3])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+
+class TestOutputParserSmoke:
+    """Smoke tests for scheduler output parser session integration."""
+
+    class _Detokenizer:
+        def __init__(self, decode_one):
+            self._decode_one = decode_one
+            self.last_segment = ""
+
+        def reset(self):
+            self.last_segment = ""
+
+        def add_token(self, token_id):
+            self.last_segment = self._decode_one(token_id)
+
+        def finalize(self):
+            self.last_segment = ""
+
+    class _GemmaTokenizer:
+        def __init__(self, token_map):
+            self._token_map = token_map
+            self.eos_token_id = 2
+            self.pad_token_id = 0
+            self.bos_token_id = 1
+
+        @property
+        def detokenizer(self):
+            return TestOutputParserSmoke._Detokenizer(
+                lambda token_id: self._token_map[token_id]
+            )
+
+        def encode(self, text: str, add_special_tokens: bool = True):
+            if text == "\n":
+                return [198]
+            return [10]
+
+        def decode(self, token_ids, skip_special_tokens: bool = True):
+            return "".join(self._token_map.get(token_id, "") for token_id in token_ids)
+
+    def test_gemma4_session_selected_and_markers_hidden(self, mock_model):
+        mock_model.config.model_type = "gemma4"
+        tokenizer = self._GemmaTokenizer(
+            {
+                11: "<|channel>",
+                12: "thought\n",
+                13: "reasoning",
+                14: "<channel|>",
+                15: "answer",
+                16: "<turn|>",
+            }
+        )
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(model_name="google/gemma-4b"),
+        )
+
+        assert scheduler._output_parser_kind == "gemma4"
+
+        request = Request(
+            request_id="gemma-req",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=5),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        responses = [
+            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 12, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 13, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 14, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 15, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 16, "finish_reason": "length"})(),
+        ]
+
+        outputs, finished_ids = scheduler._process_batch_responses(responses)
+
+        assert finished_ids == {"gemma-req"}
+        assert outputs[-1].finished is True
+        assert outputs[-1].output_text == "<think>\nreasoning</think>\nanswer"
+
+        full_stream = "".join(output.new_text for output in outputs)
+        assert "<|channel>" not in full_stream
+        assert "<channel|>" not in full_stream
+        assert full_stream == "<think>\nreasoning</think>\nanswer"
+
+
+class TestVLMPositionStateClearing:
+    """Tests for conditional mRoPE position state clearing (#531).
+
+    VLM batches must preserve position state set by get_input_embeddings();
+    text-only batches must clear stale VLM position state.
+    """
+
+    def _make_vlm_model(self):
+        """Create a mock model with clear_vlm_position_state.
+
+        Includes make_cache (returning empty list) so that
+        _do_external_prefill can call make_prompt_cache(model)
+        without hitting AttributeError on model.layers.
+        """
+        model = MagicMock(spec=[
+            "__call__", "clear_vlm_position_state", "parameters",
+            "make_cache",
+        ])
+        model.clear_vlm_position_state = MagicMock()
+        model.make_cache.return_value = []
+        return model
+
+    def test_schedule_waiting_preserves_vlm_position_state(
+        self, mock_tokenizer
+    ):
+        """VLM request in _schedule_waiting should NOT clear position state.
+
+        With external prefill, clear_vlm_position_state is called inside
+        _do_external_prefill only for text-only requests (vlm_embeds is None).
+        VLM requests pass vlm_embeds, so the clear is skipped.
+        """
+        model = self._make_vlm_model()
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+
+        # Minimal batch generator mock
+        mock_bg = MagicMock()
+        mock_bg.insert = MagicMock(return_value=[42])
+        scheduler.batch_generator = mock_bg
+
+        request = Request(
+            request_id="vlm-001",
+            prompt="describe this image",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
+        request.num_prompt_tokens = 5
+        # Use a real mx.array so _do_external_prefill can slice it
+        request.vlm_inputs_embeds = mx.zeros((1, 5, 64))
+
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+        scheduler._schedule_waiting()
+
+        model.clear_vlm_position_state.assert_not_called()
+
+    def test_schedule_waiting_clears_text_only_position_state(
+        self, mock_tokenizer
+    ):
+        """Text-only request in _schedule_waiting should clear position state.
+
+        With external prefill, clear_vlm_position_state is called inside
+        _do_external_prefill when vlm_embeds is None (text-only).
+        """
+        model = self._make_vlm_model()
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+
+        mock_bg = MagicMock()
+        mock_bg.insert = MagicMock(return_value=[42])
+        scheduler.batch_generator = mock_bg
+
+        request = Request(
+            request_id="text-001",
+            prompt="hello world",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
+        request.num_prompt_tokens = 5
+        # vlm_inputs_embeds is None by default (text-only)
+
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+        scheduler._schedule_waiting()
+
+        model.clear_vlm_position_state.assert_called_once()

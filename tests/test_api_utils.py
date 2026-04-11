@@ -9,6 +9,8 @@ text processing, content extraction, and format conversion.
 from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
     _consolidate_system_messages,
+    _drop_void_assistant_messages,
+    _extract_multimodal_content_list,
     _merge_consecutive_roles,
     clean_output_text,
     detect_and_strip_partial,
@@ -36,6 +38,7 @@ from omlx.api.openai_models import ContentPart, FunctionCall, Message, ToolCall
 from omlx.api.anthropic_models import (
     AnthropicMessage,
     AnthropicTool,
+    ContentBlockDocument,
     ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
@@ -244,13 +247,24 @@ class TestExtractTextContent:
         result = extract_text_content(messages)
 
         assert "Hello" in result[0]["content"]
+        # Ensure content is a string, not a list
+        assert isinstance(result[0]["content"], str)
 
     def test_none_content(self):
-        """Test extracting message with None content."""
+        """Test that assistant with None content and no tool_calls is dropped (void message)."""
         messages = [Message(role="assistant", content=None)]
 
         result = extract_text_content(messages)
 
+        assert len(result) == 0
+
+    def test_none_content_non_assistant_preserved(self):
+        """Test that non-assistant messages with None content are preserved."""
+        messages = [Message(role="user", content=None)]
+
+        result = extract_text_content(messages)
+
+        assert len(result) == 1
         assert result[0]["content"] == ""
 
     def test_tool_response_message(self):
@@ -269,6 +283,25 @@ class TestExtractTextContent:
         assert result[0]["role"] == "user"  # Converted to user
         assert "call_123" in result[0]["content"]
         assert "success" in result[0]["content"]
+
+    def test_tool_response_message_with_content_part_list(self):
+        """Test extracting tool response with ContentPart list content."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_text_content(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"  # Converted to user
+        assert "call_123" in result[0]["content"]
+        assert "success" in result[0]["content"]
+        # Ensure content is a string, not a list
+        assert isinstance(result[0]["content"], str)
 
     def test_tool_response_fallback_preserves_role_boundary(self):
         """Fallback tool history must not merge into adjacent user turns."""
@@ -354,6 +387,7 @@ class TestExtractTextContent:
     def test_assistant_tool_calls_with_content_array(self):
         """Content array in assistant+tool_calls should be converted to string."""
         from unittest.mock import MagicMock
+
         mock_tokenizer = MagicMock(spec=[])
         mock_tokenizer.has_tool_calling = True
 
@@ -540,6 +574,7 @@ class TestConvertAnthropicToInternal:
 
     def test_native_tool_calling_preserves_structured_tool_history(self):
         """Tool use/result blocks should stay structured when tokenizer supports tools."""
+
         class NativeToolTokenizer:
             has_tool_calling = True
 
@@ -580,6 +615,248 @@ class TestConvertAnthropicToInternal:
         assert result[1]["role"] == "tool"
         assert result[1]["tool_call_id"] == "toolu_123"
         assert result[1]["content"] == "The weather is sunny"
+
+    def test_tool_result_with_image_preserve_images_nonnative(self):
+        """Images in tool_result content are preserved when preserve_images=True (non-native path)."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, preserve_images=True)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        image_parts = [p for p in content if p.get("type") == "image_url"]
+        text_parts = [p for p in content if p.get("type") == "text"]
+        assert len(image_parts) == 1
+        assert "iVBOR" in image_parts[0]["image_url"]["url"]
+        assert len(text_parts) == 1
+        assert "toolu_img" in text_parts[0]["text"]
+
+    def test_tool_result_with_image_no_preserve(self):
+        """Images in tool_result content are NOT preserved when preserve_images=False."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, preserve_images=False)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, str)
+        assert "screenshot.png" in content
+        assert "iVBOR" not in content
+
+    def test_tool_result_with_image_native_path(self):
+        """Images in tool_result are preserved in native tool calling path."""
+
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockToolUse(
+                            id="toolu_img",
+                            name="read_file",
+                            input={"path": "/tmp/screenshot.png"},
+                        ),
+                    ],
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "iVBOR",
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "screenshot.png",
+                                },
+                            ],
+                        }
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+            preserve_images=True,
+        )
+
+        # assistant message with tool_calls
+        assert result[0]["role"] == "assistant"
+        # tool result (text only)
+        assert result[1]["role"] == "tool"
+        assert result[1]["content"] == "screenshot.png"
+        # user message with extracted image
+        assert result[2]["role"] == "user"
+        content = result[2]["content"]
+        assert isinstance(content, list)
+        image_parts = [p for p in content if p.get("type") == "image_url"]
+        assert len(image_parts) == 1
+        assert "iVBOR" in image_parts[0]["image_url"]["url"]
+
+    def test_document_block_text_plain(self):
+        """Test converting text/plain document block decodes content."""
+        import base64
+
+        text_data = base64.b64encode(b"Hello from document").decode()
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "text/plain",
+                                "data": text_data,
+                            },
+                            title="notes.txt",
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert "Hello from document" in result[0]["content"]
+        assert "[Document: notes.txt]" in result[0]["content"]
+
+    def test_document_block_pdf_placeholder(self):
+        """Test converting PDF document block returns placeholder."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0xLjQ=",
+                            },
+                            title="manual.pdf",
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "manual.pdf" in content
+        assert "oMLX does not provide PDF parsing" in content
+
+    def test_document_block_mixed_with_text(self):
+        """Test document block alongside text blocks."""
+        import base64
+
+        text_data = base64.b64encode(b"Doc content here").decode()
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockText(text="Please read this:"),
+                        ContentBlockDocument(
+                            source={
+                                "type": "base64",
+                                "media_type": "text/plain",
+                                "data": text_data,
+                            },
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request)
+
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert "Please read this:" in content
+        assert "Doc content here" in content
 
 
 class TestConvertAnthropicToolsToInternal:
@@ -883,6 +1160,23 @@ class TestExtractHarmonyMessages:
         assert len(result[0]["tool_calls"]) == 1
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
 
+    def test_tool_message_with_content_part_list(self):
+        """Test that tool messages with ContentPart list content are extracted properly."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_123"
+        # Harmony parses JSON content via _try_parse_json for |tojson compatibility
+        assert not isinstance(result[0]["content"], list)
+
     def test_json_arguments_parsed(self):
         """Test that JSON arguments are parsed to dict."""
         messages = [
@@ -924,6 +1218,72 @@ class TestExtractHarmonyMessages:
         content = result[0]["content"]
         assert isinstance(content, dict)
         assert content["result"] == "success"
+
+
+    # -- dict input tests (issue #683) --
+
+    def test_simple_dict_message(self):
+        """Plain dict messages should work (Anthropic endpoint path)."""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        result = extract_harmony_messages(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert result[0]["content"] == "Hello"
+
+    def test_tool_dict_message(self):
+        """Tool messages as dicts should preserve role and tool_call_id."""
+        messages = [
+            {
+                "role": "tool",
+                "content": '{"result": "ok"}',
+                "tool_call_id": "call_abc",
+            }
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_abc"
+        assert isinstance(result[0]["content"], dict)
+
+    def test_assistant_tool_calls_dict(self):
+        """Assistant messages with tool_calls as dicts should work."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Tokyo"}',
+                        },
+                    }
+                ],
+            }
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert "tool_calls" in result[0]
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert isinstance(result[0]["tool_calls"][0]["function"]["arguments"], dict)
+
+    def test_mixed_pydantic_and_dict_messages(self):
+        """Mixed Pydantic Message and dict inputs should both work."""
+        messages = [
+            Message(role="system", content="You are helpful."),
+            {"role": "user", "content": "Hi"},
+        ]
+
+        result = extract_harmony_messages(messages)
+
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[1]["role"] == "user"
 
 
 class TestConsolidateSystemMessages:
@@ -1024,6 +1384,20 @@ class TestConsolidateSystemMessages:
         assert "Be helpful" in result[0]["content"]
         assert "Extra instruction" in result[0]["content"]
         assert result[1]["role"] == "user"
+
+    def test_system_message_with_list_content(self):
+        """System message with list content should extract text without crashing."""
+        msgs = [
+            {"role": "system", "content": [
+                {"type": "text", "text": "Be helpful"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+            {"role": "user", "content": "Hello"},
+        ]
+        result = _consolidate_system_messages(msgs)
+        assert result[0]["role"] == "system"
+        assert isinstance(result[0]["content"], str)
+        assert "Be helpful" in result[0]["content"]
 
 
 class TestMergeConsecutiveRoles:
@@ -1145,6 +1519,70 @@ class TestMergeConsecutiveRoles:
         assert msgs[0]["content"] == original_first
         assert len(msgs) == 2
 
+    def test_merge_list_content_with_string(self):
+        """Merging list content (image) with string content should not crash."""
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "Look at this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+            {"role": "user", "content": "What do you think?"},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        types = [p["type"] for p in content]
+        assert "image_url" in types
+        assert "text" in types
+        texts = [p["text"] for p in content if p["type"] == "text"]
+        assert "Look at this" in texts
+        assert "What do you think?" in texts
+
+    def test_merge_string_with_list_content(self):
+        """String content followed by list content should merge correctly."""
+        msgs = [
+            {"role": "user", "content": "Context text"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "See image"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
+            ]},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 3  # text + text + image_url
+
+    def test_merge_two_list_contents(self):
+        """Two list contents should concatenate."""
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
+            ]},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 2
+
+    def test_merge_empty_string_with_list_content(self):
+        """Empty string + list content should take the list content."""
+        msgs = [
+            {"role": "user", "content": ""},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]},
+        ]
+        result = _merge_consecutive_roles(msgs)
+        assert len(result) == 1
+        content = result[0]["content"]
+        assert isinstance(content, list)
+
     # --- Integration tests through extract_text_content ---
 
     def test_extract_text_content_merges_consecutive_user(self):
@@ -1187,6 +1625,24 @@ class TestMergeConsecutiveRoles:
 class TestExtractMultimodalContent:
     """Tests for extract_multimodal_content normalization."""
 
+    def test_tool_message_with_content_part_list(self):
+        """Test that tool messages with ContentPart list content are converted to string."""
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "success"}')],
+                tool_call_id="call_123",
+            )
+        ]
+
+        result = extract_multimodal_content(messages)
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"  # Converted to user (no has_tool_calling)
+        assert "call_123" in result[0]["content"]
+        assert "success" in result[0]["content"]
+        assert isinstance(result[0]["content"], str)
+
     def test_converts_input_text_and_input_image(self):
         """Responses-style input_text/input_image should normalize for VLM."""
         messages = [
@@ -1216,7 +1672,10 @@ class TestExtractMultimodalContent:
                 role="user",
                 content=[
                     {"type": "text", "text": "Analyze"},
-                    {"type": "input_image", "image_url": {"url": "https://example.com/a.png"}},
+                    {
+                        "type": "input_image",
+                        "image_url": {"url": "https://example.com/a.png"},
+                    },
                 ],
             )
         ]
@@ -1226,6 +1685,45 @@ class TestExtractMultimodalContent:
         content = result[0]["content"]
         assert content[1]["type"] == "image_url"
         assert content[1]["image_url"]["url"] == "https://example.com/a.png"
+
+    def test_normalizes_image_url_from_model_dump(self):
+        """image_url items from model_dump should be normalized (strip extra keys)."""
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "What is this?"},
+                    {
+                        "type": "image_url",
+                        "text": None,
+                        "image_url": {"url": "data:image/png;base64,abc", "detail": "auto"},
+                    },
+                ],
+            )
+        ]
+        result = extract_multimodal_content(messages)
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        img_part = content[1]
+        assert img_part == {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        assert "text" not in img_part
+        assert "detail" not in img_part.get("image_url", {})
+
+    def test_normalizes_image_url_string_form(self):
+        """image_url with string value (not nested dict) should be normalized."""
+        parts = _extract_multimodal_content_list([
+            {"type": "image_url", "image_url": "data:image/png;base64,abc"},
+        ])
+        assert len(parts) == 1
+        assert parts[0] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+
+    def test_image_url_missing_url_dropped(self):
+        """image_url item with no extractable URL should be dropped."""
+        parts = _extract_multimodal_content_list([
+            {"type": "image_url", "image_url": None},
+            {"type": "image_url"},
+        ])
+        assert len(parts) == 0
 
 
 # =============================================================================
@@ -1316,7 +1814,9 @@ class TestExtractTextContentPreservesNamePartial:
                 role="assistant",
                 content="Let me call a tool",
                 name="Kimi",
-                tool_calls=[{"id": "1", "function": {"name": "search", "arguments": "{}"}}],
+                tool_calls=[
+                    {"id": "1", "function": {"name": "search", "arguments": "{}"}}
+                ],
             ),
         ]
         result = extract_text_content(messages)
@@ -1424,3 +1924,109 @@ class TestNameFieldSchemaAcceptance:
         msgs = [Message(role="user", content="Hello")]
         result = extract_text_content(msgs)
         assert "name" not in result[0]
+
+
+class TestDropVoidAssistantMessages:
+    """Tests for _drop_void_assistant_messages."""
+
+    def test_drops_empty_content_no_tool_calls(self):
+        """Assistant message with empty content and no tool_calls should be dropped."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "Again"},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 2
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "user"
+
+    def test_drops_none_content_no_tool_calls(self):
+        """Assistant message with None content and no tool_calls should be dropped."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": None},
+            {"role": "user", "content": "Again"},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 2
+
+    def test_keeps_assistant_with_content(self):
+        """Assistant message with non-empty content should be kept."""
+        msgs = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "Thanks"},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 3
+
+    def test_keeps_assistant_with_tool_calls(self):
+        """Assistant message with tool_calls should be kept even if content is empty."""
+        msgs = [
+            {"role": "user", "content": "List files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "1", "function": {"name": "ls"}}],
+            },
+            {"role": "user", "content": "Thanks"},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 3
+
+    def test_preserves_other_roles(self):
+        """Non-assistant messages should never be dropped."""
+        msgs = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": ""},
+            {"role": "tool", "content": ""},
+        ]
+        result = _drop_void_assistant_messages(msgs)
+        assert len(result) == 3
+
+    def test_extract_text_content_drops_void_assistant(self):
+        """Integration: extract_text_content should drop void assistant messages."""
+        msgs = [
+            Message(role="user", content="Hello"),
+            Message(role="assistant", content=None),
+            Message(role="user", content="Tell me about this repo"),
+        ]
+        result = extract_text_content(msgs)
+        # The void assistant message should be dropped, and the two user
+        # messages merged by _merge_consecutive_roles
+        assert all(m["role"] != "assistant" or m.get("content") for m in result)
+
+    def test_void_drop_then_merge_consecutive_users(self):
+        """Dropping a void assistant between two users should merge them."""
+        msgs = [
+            Message(role="user", content="hello"),
+            Message(role="assistant", content=None),
+            Message(role="user", content="world"),
+        ]
+        result = extract_text_content(msgs)
+        # void assistant dropped, then consecutive users merged
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert "hello" in result[0]["content"]
+        assert "world" in result[0]["content"]
+
+    def test_multiple_void_assistants_merge_surrounding_users(self):
+        """Multiple void assistants should be dropped and adjacent users merged."""
+        msgs = [
+            Message(role="user", content="a"),
+            Message(role="assistant", content=None),
+            Message(role="user", content="b"),
+            Message(role="assistant", content="reply"),
+            Message(role="user", content="c"),
+            Message(role="assistant", content=None),
+            Message(role="user", content="d"),
+        ]
+        result = extract_text_content(msgs)
+        assert len(result) == 3
+        assert result[0]["role"] == "user"
+        assert "a" in result[0]["content"] and "b" in result[0]["content"]
+        assert result[1]["role"] == "assistant"
+        assert result[1]["content"] == "reply"
+        assert result[2]["role"] == "user"
+        assert "c" in result[2]["content"] and "d" in result[2]["content"]

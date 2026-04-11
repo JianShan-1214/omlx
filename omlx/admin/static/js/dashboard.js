@@ -7,13 +7,18 @@
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
-    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer']);
+    const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
 
     function dashboard() {
         return {
             // Theme
-            theme: localStorage.getItem('omlx-chat-theme') || 'light',
+            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            activeTheme: 'light', // Will be updated by applyTheme
+            systemThemeListener: null,
+
+            // Mobile menu
+            mobileMenuOpen: false,
 
             // Main tab state (Status, Settings, or Logs)
             mainTab: 'status',
@@ -27,7 +32,7 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
-                scheduler: { max_num_seqs: 8, completion_batch_size: 8 },
+                scheduler: { max_concurrent_requests: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
@@ -141,6 +146,7 @@
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
+            showClearSsdCacheConfirm: false,
             _statsRefreshTimer: null,
 
             // Log viewer state
@@ -251,6 +257,7 @@
 
             // oQ Quantizer state
             oqModels: [],
+            oqAllModels: [],
             oqModelsLoaded: false,
             oqSelectedModelPath: '',
             oqLevel: 4,
@@ -261,12 +268,32 @@
             _oqRefreshTimer: null,
             // oQ Advanced Settings
             oqAdvancedOpen: false,
-            oqEnableClip: false,
-            oqGroupSize: 64,
-            oqClipSamples: 128,
-            oqClipSeqLen: 512,
-            oqCalibDataset: 'code_multilingual',
-            oqClipBatchSize: 1024,
+            oqTextOnly: false,
+            oqSensitivityModelPath: '',
+
+            // oQ Uploader state
+            uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
+            uploadHfUsername: '',
+            uploadHfOrgs: [],
+            uploadHfNamespace: '',
+            uploadTokenValidated: false,
+            uploadTokenValidating: false,
+            uploadOqModels: [],
+            uploadAllModels: [],
+            uploadOqModelsLoaded: false,
+            uploadTasks: [],
+            uploadError: '',
+            uploadSuccess: '',
+            _uploadRefreshTimer: null,
+            // Upload modal
+            uploadModalOpen: false,
+            uploadModalModelPath: '',
+            uploadModalModelName: '',
+            uploadModalRepoId: '',
+            uploadReadmeSource: '',
+            uploadAutoReadme: true,
+            uploadPrivate: false,
+            uploadStarting: false,
 
             // Benchmark state
             benchModelId: '',
@@ -276,15 +303,13 @@
             benchBenchId: null,
             benchProgress: null,
             benchSingleResults: [],
-            benchBatchSameResults: [],
-            benchBatchDiffResults: [],
+            benchBatchResults: [],
             benchError: '',
             benchEventSource: null,
             benchShowMetrics: false,
             benchShowText: false,
             benchCopied: false,
             benchTip: null,
-            benchIncludeImage: false,
             benchDeviceInfo: null,
             benchUploadResults: [],
             benchUploadDone: null,
@@ -296,16 +321,24 @@
 
             // Accuracy benchmark state
             accModelId: '',
-            accBenchmarks: { mmlu: true, hellaswag: true, truthfulqa: true, gsm8k: false, livecodebench: false },
-            accSampleSizes: { mmlu: 300, hellaswag: 200, truthfulqa: 200, gsm8k: 100, livecodebench: 100 },
+            accBenchmarks: { mmlu: true, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, humaneval: true, mbpp: false, livecodebench: false },
+            accSampleSizes: { mmlu: 1000, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, humaneval: 0, mbpp: 200, livecodebench: 100 },
             accBenchmarkList: [
                 { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                 { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                 { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
                 { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
+                { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
                 { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
             ],
             accBatchSize: 1,
+            accEnableThinking: false,
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -327,9 +360,6 @@
                     this.loadModels(),
                     this.checkForUpdate()
                 ]);
-                this.$nextTick(() => {
-                    lucide.createIcons();
-                });
 
                 this.startUpdateCheckTimer();
 
@@ -364,6 +394,16 @@
 
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
+                });
+
+                // Pause stats polling when tab is hidden to reduce server load
+                document.addEventListener('visibilitychange', () => {
+                    if (document.hidden) {
+                        this.stopStatsRefresh();
+                    } else if (this.mainTab === 'status') {
+                        this.loadStats();
+                        this.startStatsRefresh();
+                    }
                 });
             },
 
@@ -410,7 +450,6 @@
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
                     await this.loadAccState();
                 }
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTabStateFromUrl() {
@@ -472,6 +511,10 @@
                 this.syncTabStateToUrl();
                 if (tab === 'quantizer') {
                     this.loadOQModels();
+                }
+                if (tab === 'uploader') {
+                    if (!this.uploadOqModelsLoaded) this.loadUploadOqModels();
+                    this.loadUploadTasks();
                 }
             },
 
@@ -586,8 +629,7 @@
                 if (!s.server.host) errors.push('Host');
                 if (!s.server.port) errors.push('Port');
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_num_seqs) errors.push('Max Sequences');
-                if (!s.scheduler.completion_batch_size) errors.push('Completion Batch Size');
+                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
                 if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
                 if (!s.sampling.max_context_window) errors.push('Max Context Window');
                 if (!s.sampling.max_tokens) errors.push('Max Tokens');
@@ -625,8 +667,7 @@
                             model_fallback: this.globalSettings.model.model_fallback,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
-                            max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
-                            completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
+                            max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -648,7 +689,6 @@
                         const data = await response.json();
                         this.saveSuccess = true;
                         this.saveMessage = data.message || 'Settings saved successfully';
-                        this.$nextTick(() => lucide.createIcons());
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
@@ -660,14 +700,12 @@
                         this.saveError = Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
-                        this.$nextTick(() => lucide.createIcons());
                     }
                 } catch (err) {
                     console.error('Failed to save global settings:', err);
                     this.saveError = window.t('js.error.save_settings_failed');
                     // Reload settings to revert to server values
                     await this.loadGlobalSettings();
-                    this.$nextTick(() => lucide.createIcons());
                 } finally {
                     this.saving = false;
                 }
@@ -740,7 +778,6 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.models = data.models || [];
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -880,9 +917,12 @@
                     thinking_budget_tokens: settings.thinking_budget_tokens || null,
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
+                    reasoning_parser: settings.reasoning_parser || '',
                     ttl_seconds: settings.ttl_seconds ?? null,
                     enableIndexCache: !!(settings.index_cache_freq),
                     index_cache_freq: settings.index_cache_freq || null,
+                    turboquant_kv_enabled: settings.turboquant_kv_enabled || false,
+                    turboquant_kv_bits: settings.turboquant_kv_bits || 4,
                     specprefill_enabled: settings.specprefill_enabled || false,
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
@@ -890,7 +930,6 @@
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             async saveModelSettings() {
@@ -934,6 +973,7 @@
                                 min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
                                 force_sampling: this.modelSettings.force_sampling,
+                                reasoning_parser: this.modelSettings.reasoning_parser || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
@@ -949,6 +989,10 @@
                                     ? chatTemplateKwargs : null,
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
                                     ? forcedCtKwargs : null,
+                                turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
+                                turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
+                                    ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
+                                    : 4,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
@@ -1185,7 +1229,6 @@
                         const alltimeData = await alltimeResponse.json();
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
                     }
-                    this.$nextTick(() => lucide.createIcons());
                 } catch (err) {
                     console.error('Failed to load stats:', err);
                 }
@@ -1210,6 +1253,17 @@
                 } catch (err) {
                     console.error('Failed to clear all-time stats:', err);
                     this.showClearAlltimeConfirm = false;
+                }
+            },
+
+            async clearSsdCache() {
+                try {
+                    await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    this.showClearSsdCacheConfirm = false;
+                    await this.loadStats();
+                } catch (err) {
+                    console.error('Failed to clear SSD cache:', err);
+                    this.showClearSsdCacheConfirm = false;
                 }
             },
 
@@ -1320,8 +1374,7 @@
                 this.benchRunning = true;
                 this.benchProgress = null;
                 this.benchSingleResults = [];
-                this.benchBatchSameResults = [];
-                this.benchBatchDiffResults = [];
+                this.benchBatchResults = [];
                 this.benchError = '';
                 this.benchBenchId = null;
                 this.benchUploadResults = [];
@@ -1337,7 +1390,6 @@
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
-                            include_image: this.benchIncludeImage,
                         }),
                     });
 
@@ -1385,10 +1437,8 @@
                         } else if (data.type === 'result') {
                             if (data.data.test_type === 'single') {
                                 this.benchSingleResults = [...this.benchSingleResults, data.data];
-                            } else if (data.data.test_type === 'batch_same') {
-                                this.benchBatchSameResults = [...this.benchBatchSameResults, data.data];
-                            } else if (data.data.test_type === 'batch_diff') {
-                                this.benchBatchDiffResults = [...this.benchBatchDiffResults, data.data];
+                            } else if (data.data.test_type === 'batch') {
+                                this.benchBatchResults = [...this.benchBatchResults, data.data];
                             }
                         } else if (data.type === 'done') {
                             // Benchmark tests done, uploading starts
@@ -1418,7 +1468,6 @@
                             this.loadModels();
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } catch (err) {
                         console.error('Failed to parse SSE event:', err);
                     }
@@ -1528,16 +1577,10 @@
                     }
                 };
 
-                const imgSuffix = this.benchIncludeImage ? ' + image tokens' : '';
                 buildBatchText(
-                    'Continuous Batching — Same Prompt',
-                    `pp1024${imgSuffix} / tg128 · partial prefix cache hit`,
-                    this.benchBatchSameResults
-                );
-                buildBatchText(
-                    'Continuous Batching — Different Prompts',
-                    `pp1024${imgSuffix} / tg128 · no cache reuse`,
-                    this.benchBatchDiffResults
+                    'Continuous Batching',
+                    'pp1024 / tg128',
+                    this.benchBatchResults
                 );
 
                 return lines.join('\n');
@@ -1644,6 +1687,7 @@
                                 selected.map(k => [k, this.accSampleSizes[k]])
                             ),
                             batch_size: this.accBatchSize,
+                            enable_thinking: this.accEnableThinking,
                         }),
                     });
                     if (!resp.ok) {
@@ -1854,15 +1898,16 @@
                 for (const m of models) {
                     lines.push('');
                     lines.push('Model: ' + m);
-                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10));
-                    lines.push('-'.repeat(54));
+                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8));
+                    lines.push('-'.repeat(62));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
                             rpad(r.benchmark.toUpperCase(), 16) +
                             pad((r.accuracy * 100).toFixed(1) + '%', 10) +
                             pad(r.correct, 10) +
                             pad(r.total, 8) +
-                            pad(r.time_s, 10)
+                            pad(r.time_s, 10) +
+                            pad(r.thinking_used ? 'Yes' : 'No', 8)
                         );
                     }
                 }
@@ -1900,6 +1945,7 @@
                         correct: r.correct,
                         total: r.total,
                         time_s: r.time_s,
+                        thinking_used: r.thinking_used || false,
                         category_scores: r.category_scores || null,
                         questions: qr,
                     }, null, 2);
@@ -2391,16 +2437,37 @@
                 }
             },
 
-            // Theme toggle
-            toggleTheme() {
-                this.theme = this.theme === 'light' ? 'dark' : 'light';
+            // Theme select
+            setTheme(theme) {
+                this.theme = theme;
                 localStorage.setItem('omlx-chat-theme', this.theme);
                 this.applyTheme();
-                this.$nextTick(() => lucide.createIcons());
             },
 
             applyTheme() {
-                document.documentElement.setAttribute('data-theme', this.theme);
+                // Clean up existing listener
+                if (this.systemThemeListener) {
+                    window.matchMedia('(prefers-color-scheme: dark)').removeEventListener('change', this.systemThemeListener);
+                    this.systemThemeListener = null;
+                }
+
+                if (this.theme === 'auto') {
+                    // Detect system theme
+                    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                    this.activeTheme = prefersDark ? 'dark' : 'light';
+                    document.documentElement.setAttribute('data-theme', this.activeTheme);
+
+                    // Add listener for system theme changes
+                    this.systemThemeListener = (e) => {
+                        this.activeTheme = e.matches ? 'dark' : 'light';
+                        document.documentElement.setAttribute('data-theme', this.activeTheme);
+                    };
+                    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', this.systemThemeListener);
+                } else {
+                    // Use explicit theme
+                    this.activeTheme = this.theme;
+                    document.documentElement.setAttribute('data-theme', this.activeTheme);
+                }
             },
 
             // =================================================================
@@ -2483,7 +2550,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfDownloading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2506,7 +2572,6 @@
                             }
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2522,7 +2587,6 @@
                         const data = await response.json();
                         this.hfModels = data.models || [];
                         this.hfModelsLoaded = true;
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2629,6 +2693,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.oqModels = data.models || [];
+                        this.oqAllModels = data.all_models || [];
                         this.oqModelsLoaded = true;
                     }
                 } catch (err) {
@@ -2648,12 +2713,9 @@
                         body: JSON.stringify({
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
-                            enable_clip: this.oqEnableClip,
-                            group_size: this.oqGroupSize,
-                            clip_num_samples: this.oqClipSamples,
-                            clip_seq_length: this.oqClipSeqLen,
-                            calib_dataset: this.oqCalibDataset,
-                            clip_batch_size: this.oqClipBatchSize,
+                            group_size: 64,
+                            sensitivity_model_path: this.oqSensitivityModelPath,
+                            text_only: this.oqTextOnly,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -2671,7 +2733,6 @@
                     this.oqError = 'Connection error. Server may be unavailable.';
                 } finally {
                     this.oqStarting = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2691,7 +2752,6 @@
                                 await this.loadOQModels();
                             }
                         }
-                        this.$nextTick(() => lucide.createIcons());
                     }
                 } catch (err) {
                     console.error('Failed to load oQ tasks:', err);
@@ -2744,25 +2804,39 @@
                 return `${mins}:${String(secs).padStart(2, '0')}`;
             },
 
-            oqSelectedModelSupportsClip() {
+            oqSensitivityModelCandidates() {
+                if (!this.oqSelectedModelPath) return [];
+                const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!source) return [];
+                return this.oqAllModels.filter(m =>
+                    m.path !== this.oqSelectedModelPath &&
+                    m.is_quantized &&
+                    m.model_type === source.model_type
+                );
+            },
+
+            oqSelectedModelIsVLM() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
-                return model?.supports_clip || false;
+                return model?.is_vlm || false;
             },
 
             oqEstimatedMemory() {
                 // Use precise estimate from API if available
                 if (this.oqEstimate) {
-                    if (this.oqEnableClip) {
-                        return this.oqEstimate.memory_clip_formatted || '';
+                    // If sensitivity model selected, memory ≈ sensitivity model size × 1.5
+                    if (this.oqSensitivityModelPath) {
+                        const sensModel = this.oqAllModels.find(m => m.path === this.oqSensitivityModelPath);
+                        if (sensModel) {
+                            const bytes = Math.round(sensModel.size * 1.5) + 5 * 1024 * 1024 * 1024;
+                            if (bytes > 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+                            return (bytes / (1024 * 1024)).toFixed(0) + ' MB';
+                        }
                     }
                     return this.oqEstimate.memory_streaming_formatted || '';
                 }
                 // Fallback to rough model-level estimate
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 if (!model) return '';
-                if (this.oqEnableClip) {
-                    return model.memory_clip?.peak_formatted || '';
-                }
                 return model.memory_streaming?.peak_formatted || '';
             },
 
@@ -2801,6 +2875,158 @@
             },
 
             // =================================================================
+            // oQ Uploader Functions
+            // =================================================================
+
+            async validateUploadToken() {
+                if (!this.uploadHfToken || this.uploadTokenValidating) return;
+                this.uploadTokenValidating = true;
+                this.uploadError = '';
+                try {
+                    const response = await fetch('/admin/api/upload/validate-token', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ hf_token: this.uploadHfToken }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok) {
+                        this.uploadHfUsername = data.username || '';
+                        this.uploadHfOrgs = data.orgs || [];
+                        this.uploadHfNamespace = this.uploadHfUsername;
+                        this.uploadTokenValidated = true;
+                        localStorage.setItem('omlx-hf-upload-token', this.uploadHfToken);
+                        this.loadUploadOqModels();
+                    } else {
+                        this.uploadError = data.detail || window.t('models.uploader.invalid_token');
+                        this.uploadTokenValidated = false;
+                    }
+                } catch (err) {
+                    this.uploadError = 'Connection error. Server may be unavailable.';
+                } finally {
+                    this.uploadTokenValidating = false;
+                }
+            },
+
+            async loadUploadOqModels() {
+                try {
+                    const response = await fetch('/admin/api/upload/oq-models');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.uploadOqModels = data.oq_models || [];
+                        this.uploadAllModels = data.all_models || [];
+                        this.uploadOqModelsLoaded = true;
+                    }
+                } catch (err) {
+                    console.error('Failed to load oQ models for upload:', err);
+                }
+            },
+
+            openUploadModal(model) {
+                this.uploadModalModelPath = model.path;
+                this.uploadModalModelName = model.name;
+                this.uploadModalRepoId = (this.uploadHfNamespace || this.uploadHfUsername) + '/' + model.name;
+                this.uploadReadmeSource = '';
+                this.uploadAutoReadme = true;
+                this.uploadRedownloadNotice = false;
+                this.uploadPrivate = false;
+                this.uploadStarting = false;
+                this.uploadModalOpen = true;
+            },
+
+            async startUpload() {
+                if (!this.uploadModalRepoId || this.uploadStarting) return;
+                this.uploadStarting = true;
+                this.uploadError = '';
+                try {
+                    const response = await fetch('/admin/api/upload/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_path: this.uploadModalModelPath,
+                            repo_id: this.uploadModalRepoId,
+                            hf_token: this.uploadHfToken,
+                            readme_source_path: this.uploadReadmeSource,
+                            auto_readme: this.uploadAutoReadme,
+                            redownload_notice: this.uploadRedownloadNotice && this.uploadReadmeSource === '',
+                            private: this.uploadPrivate,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.ok) {
+                        this.uploadModalOpen = false;
+                        this.uploadSuccess = `Upload queued: ${this.uploadModalModelName}`;
+                        await this.loadUploadTasks();
+                        this.startUploadRefresh();
+                        setTimeout(() => { this.uploadSuccess = ''; }, 5000);
+                    } else {
+                        this.uploadError = data.detail || 'Failed to start upload';
+                    }
+                } catch (err) {
+                    this.uploadError = 'Connection error. Server may be unavailable.';
+                } finally {
+                    this.uploadStarting = false;
+                }
+            },
+
+            async loadUploadTasks() {
+                try {
+                    const response = await fetch('/admin/api/upload/tasks');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.uploadTasks = data.tasks || [];
+                        const hasActive = this.uploadTasks.some(t =>
+                            ['pending', 'uploading'].includes(t.status));
+                        if (!hasActive) {
+                            this.stopUploadRefresh();
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to load upload tasks:', err);
+                }
+            },
+
+            async cancelUploadTask(taskId) {
+                try {
+                    await fetch(`/admin/api/upload/cancel/${taskId}`, { method: 'POST' });
+                    await this.loadUploadTasks();
+                } catch (err) {
+                    console.error('Failed to cancel upload task:', err);
+                }
+            },
+
+            async removeUploadTask(taskId) {
+                try {
+                    await fetch(`/admin/api/upload/task/${taskId}`, { method: 'DELETE' });
+                    await this.loadUploadTasks();
+                } catch (err) {
+                    console.error('Failed to remove upload task:', err);
+                }
+            },
+
+            startUploadRefresh() {
+                this.stopUploadRefresh();
+                this._uploadRefreshTimer = setInterval(() => {
+                    this.loadUploadTasks();
+                }, 2000);
+            },
+
+            stopUploadRefresh() {
+                if (this._uploadRefreshTimer) {
+                    clearInterval(this._uploadRefreshTimer);
+                    this._uploadRefreshTimer = null;
+                }
+            },
+
+            formatUploadElapsed(task) {
+                if (!task.started_at) return '';
+                const now = task.completed_at || (Date.now() / 1000);
+                const elapsed = now - task.started_at;
+                const mins = Math.floor(elapsed / 60);
+                const secs = Math.floor(elapsed % 60);
+                return `${mins}:${String(secs).padStart(2, '0')}`;
+            },
+
+            // =================================================================
             // Recommended Models Functions
             // =================================================================
 
@@ -2833,7 +3059,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfRecommendedLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2879,7 +3104,6 @@
 
             setPage(tab, page) {
                 this.hfPage[tab] = page;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // Search
@@ -2922,7 +3146,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfSearchLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -2993,7 +3216,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.hfModelDetailLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3034,7 +3256,6 @@
                 if (this.msAvailable) {
                     await this.loadMSTasks();
                 }
-                this.$nextTick(() => lucide.createIcons());
             },
 
             async startMSDownload() {
@@ -3085,7 +3306,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msDownloading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3106,7 +3326,6 @@
                             }
                         }
 
-                        this.$nextTick(() => lucide.createIcons());
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -3211,7 +3430,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msRecommendedLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3237,7 +3455,6 @@
 
             setMsPage(tab, page) {
                 this.msPage[tab] = page;
-                this.$nextTick(() => lucide.createIcons());
             },
 
             // MS Search
@@ -3278,7 +3495,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msSearchLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
 
@@ -3341,7 +3557,6 @@
                 } finally {
                     clearTimeout(timeoutId);
                     this.msModelDetailLoading = false;
-                    this.$nextTick(() => lucide.createIcons());
                 }
             },
         }
